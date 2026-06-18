@@ -20,8 +20,8 @@ INDEX_TIP = 8
 THUMB_TIP = 4
 
 
-def get_hand_points(hand_landmarks, w, h):
-    """Возвращает (index_tip, thumb_tip) если L-жест, иначе None"""
+def get_hand_points(hand_landmarks, w, h, label):
+    """Возвращает (index_tip, thumb_tip) если L-жест"""
     lm = hand_landmarks.landmark
     index_up = lm[8].y < lm[6].y < lm[5].y
     middle_down = lm[12].y > lm[10].y
@@ -36,71 +36,79 @@ def get_hand_points(hand_landmarks, w, h):
     return (ix, iy), (tx, ty)
 
 
+def make_quad(left_hand, right_hand):
+    """
+    Строим четырёхугольник правильно:
+    Левая рука: большой палец = левый нижний угол, указательный = левый верхний
+    Правая рука: большой палец = правый нижний угол, указательный = правый верхний
+    Порядок: верх-лево, верх-право, низ-право, низ-лево (для корректного polylines)
+    """
+    l_idx, l_thm = left_hand   # левая: указательный, большой
+    r_idx, r_thm = right_hand  # правая: указательный, большой
+
+    # Определяем какая рука левая/правая по X-координате большого пальца
+    # (большой палец левой руки правее чем указательный, правой — левее)
+    # Проще: берём руку с меньшим X центра как левую
+    l_cx = (l_idx[0] + l_thm[0]) // 2
+    r_cx = (r_idx[0] + r_thm[0]) // 2
+
+    if l_cx > r_cx:
+        left_hand, right_hand = right_hand, left_hand
+        l_idx, l_thm = left_hand
+        r_idx, r_thm = right_hand
+
+    # Четыре угла: верх-лево=левый указательный, верх-право=правый указательный
+    #              низ-лево=левый большой, низ-право=правый большой
+    tl = np.array(l_idx)
+    tr = np.array(r_idx)
+    br = np.array(r_thm)
+    bl = np.array(l_thm)
+
+    return np.array([tl, tr, br, bl], dtype=np.int32)
+
+
 def apply_quad_effect(frame, pts):
     """
-    pts: 4 точки четырёхугольника (numpy array shape (4,2))
-    Внутри: тёмный фон + пурпурный силуэт (как тепловизор)
-    Рамка: тонкая пурпурная с glow
+    Внутри четырёхугольника:
+    - тёмный фон (почти чёрный)
+    - пурпурный силуэт (инверт без зелёного)
+    - тонкая пурпурная рамка с glow
     """
     H, W = frame.shape[:2]
     result = frame.copy()
 
-    # Маска четырёхугольника
+    # Маска
     mask = np.zeros((H, W), dtype=np.uint8)
     cv2.fillPoly(mask, [pts], 255)
+    mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
 
-    # Регион внутри
-    region = frame.copy()
+    # Тёмный фон
+    dark = (frame * 0.06).astype(np.uint8)
 
-    # 1. Тёмный фон — почти чёрный
-    dark = (region * 0.05).astype(np.uint8)
+    # Пурпурный инверт
+    inv = cv2.bitwise_not(frame)
+    purple = inv.copy()
+    purple[:, :, 1] = 0   # убить зелёный
+    purple[:, :, 2] = (purple[:, :, 2] * 0.7).astype(np.uint8)  # приглушить красный
 
-    # 2. Пурпурный инверт — убираем зелёный канал
-    inverted = cv2.bitwise_not(region)
-    purple = inverted.copy()
-    purple[:, :, 1] = (purple[:, :, 1] * 0.0).astype(np.uint8)   # убить зелёный полностью
-    purple[:, :, 2] = (purple[:, :, 2] * 0.85).astype(np.uint8)  # немного убрать красный
+    # Мягкий glow
+    glow = cv2.GaussianBlur(purple, (31, 31), 0)
 
-    # 3. Размытый glow
-    glow = cv2.GaussianBlur(purple, (25, 25), 0)
+    # Финальный эффект = тёмный + пурпур + glow
+    effect = cv2.addWeighted(dark, 0.15, purple, 0.55, 0)
+    effect = cv2.addWeighted(effect, 1.0, glow, 0.45, 0)
 
-    # 4. Смешиваем: тёмный + пурпур + glow
-    blended = cv2.addWeighted(dark, 0.2, purple, 0.6, 0)
-    blended = cv2.addWeighted(blended, 1.0, glow, 0.5, 0)
+    # Накладываем по маске
+    result = (frame.astype(np.float32) * (1 - mask3) + effect.astype(np.float32) * mask3).astype(np.uint8)
 
-    # 5. Применяем только внутри маски
-    mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    mask_f = mask3.astype(np.float32) / 255.0
-    result = (frame.astype(np.float32) * (1 - mask_f) + blended.astype(np.float32) * mask_f).astype(np.uint8)
-
-    # 6. Рамка — тонкая пурпурная с glow
-    border_color = (255, 0, 200)
-
-    # Glow рамки (широкая полупрозрачная)
+    # Рамка с glow
+    color = (255, 0, 200)
     glow_layer = result.copy()
-    cv2.polylines(glow_layer, [pts], True, border_color, 12)
-    result = cv2.addWeighted(result, 0.75, glow_layer, 0.25, 0)
-
-    # Основная рамка (тонкая чёткая)
-    cv2.polylines(result, [pts], True, border_color, 2)
+    cv2.polylines(glow_layer, [pts], True, color, 14)
+    result = cv2.addWeighted(result, 0.72, glow_layer, 0.28, 0)
+    cv2.polylines(result, [pts], True, color, 2)
 
     return result
-
-
-def order_points(pts_list):
-    """
-    pts_list: список из 4 точек [(x,y), ...]
-    Упорядочивает по часовой: верх-лево, верх-право, низ-право, низ-лево
-    """
-    pts = np.array(pts_list, dtype=np.int32)
-    # Сортируем по сумме координат
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).ravel()
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-    return np.array([tl, tr, br, bl], dtype=np.int32)
 
 
 def process_video(input_path: str, output_path: str):
@@ -121,7 +129,7 @@ def process_video(input_path: str, output_path: str):
     )
 
     prev_pts = None
-    smooth = 0.5
+    smooth = 0.45
 
     while True:
         ret, frame = cap.read()
@@ -132,28 +140,25 @@ def process_video(input_path: str, output_path: str):
         results = hands.process(rgb)
 
         hand_points = []
-        if results.multi_hand_landmarks:
-            for hand_lm in results.multi_hand_landmarks:
-                pts = get_hand_points(hand_lm, w, h)
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for hand_lm, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
+                label = hand_info.classification[0].label  # 'Left' or 'Right'
+                pts = get_hand_points(hand_lm, w, h, label)
                 if pts is not None:
                     hand_points.append(pts)
 
         if len(hand_points) == 2:
-            # 4 точки: index и thumb каждой руки
-            p0_idx, p0_thm = hand_points[0]
-            p1_idx, p1_thm = hand_points[1]
-            raw_pts = [p0_idx, p0_thm, p1_idx, p1_thm]
+            try:
+                quad = make_quad(hand_points[0], hand_points[1])
 
-            ordered = order_points(raw_pts)
+                if prev_pts is None:
+                    prev_pts = quad.astype(np.float32)
+                else:
+                    prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
 
-            # Сглаживание
-            if prev_pts is None:
-                prev_pts = ordered.astype(np.float32)
-            else:
-                prev_pts = prev_pts * (1 - smooth) + ordered.astype(np.float32) * smooth
-
-            quad = prev_pts.astype(np.int32)
-            frame = apply_quad_effect(frame, quad)
+                frame = apply_quad_effect(frame, prev_pts.astype(np.int32))
+            except Exception:
+                pass
         else:
             prev_pts = None
 
@@ -163,7 +168,6 @@ def process_video(input_path: str, output_path: str):
     out.release()
     hands.close()
 
-    # Склеиваем с аудио
     cmd = ["ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
            "-c:v", "libx264", "-c:a", "aac",
            "-map", "0:v:0", "-map", "1:a:0",
@@ -208,8 +212,8 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Отправь кружок с L-жестом двумя руками!\n\n"
-        "🤙 Жест: указательный вверх + большой в сторону (обе руки)\n"
-        "Форма строится по 4 пальцам — можешь наклонять и менять форму!"
+        "🤙 Указательный вверх + большой в сторону — обе руки.\n"
+        "Форма строится по 4 пальцам, можно наклонять и менять!"
     )
 
 
@@ -223,3 +227,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
