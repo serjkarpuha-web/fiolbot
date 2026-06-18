@@ -11,49 +11,77 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 mp_hands = mp.solutions.hands
-INDEX_TIP = 8
+
+# Индексы ландмарков
+INDEX_TIP = 8   # кончик указательного
+THUMB_TIP = 4   # кончик большого
 
 
-def is_l_gesture(hand_landmarks):
+def get_hand_points(hand_landmarks, w, h):
+    """Возвращает (index_tip, thumb_tip) в пикселях если L-жест, иначе None"""
     lm = hand_landmarks.landmark
+
+    # Указательный поднят
     index_up = lm[8].y < lm[6].y < lm[5].y
+    # Остальные (кроме большого) согнуты
     middle_down = lm[12].y > lm[10].y
-    ring_down = lm[16].y > lm[14].y
-    pinky_down = lm[20].y > lm[18].y
-    return index_up and middle_down and ring_down and pinky_down
+    ring_down   = lm[16].y > lm[14].y
+    pinky_down  = lm[20].y > lm[18].y
+
+    if not (index_up and middle_down and ring_down and pinky_down):
+        return None
+
+    ix = int(lm[INDEX_TIP].x * w)
+    iy = int(lm[INDEX_TIP].y * h)
+    tx = int(lm[THUMB_TIP].x * w)
+    ty = int(lm[THUMB_TIP].y * h)
+    return (ix, iy), (tx, ty)
 
 
-def apply_rect_effect(frame, x1, y1, x2, y2):
-    h, w = frame.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
+def apply_effect(frame, x1, y1, x2, y2):
+    """Внутри прямоугольника: тёмный фон + пурпурный инвертированный эффект + пурпурная рамка с glow"""
+    H, W = frame.shape[:2]
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(W, x2); y2 = min(H, y2)
     if x2 <= x1 or y2 <= y1:
         return frame
 
     result = frame.copy()
     region = frame[y1:y2, x1:x2].copy()
 
+    # Инвертируем
     inverted = cv2.bitwise_not(region)
-    dark = (region * 0.12).astype(np.uint8)
+
+    # Убираем зелёный канал → пурпур
     purple = inverted.copy()
-    purple[:, :, 1] = (purple[:, :, 1] * 0.1).astype(np.uint8)
-    blended = cv2.addWeighted(dark, 0.4, purple, 0.75, 0)
-    glow = cv2.GaussianBlur(purple, (15, 15), 0)
-    blended = cv2.addWeighted(blended, 1.0, glow, 0.35, 0)
+    purple[:, :, 1] = (purple[:, :, 1] * 0.05).astype(np.uint8)
+
+    # Тёмный фон
+    dark = (region * 0.08).astype(np.uint8)
+
+    # Смешиваем
+    blended = cv2.addWeighted(dark, 0.3, purple, 0.85, 0)
+
+    # Glow поверх
+    glow = cv2.GaussianBlur(purple, (21, 21), 0)
+    blended = cv2.addWeighted(blended, 1.0, glow, 0.4, 0)
+
     result[y1:y2, x1:x2] = blended
 
-    border_color = (220, 0, 255)
-    cv2.rectangle(result, (x1, y1), (x2, y2), border_color, 3)
-    overlay = result.copy()
-    cv2.rectangle(overlay, (x1-4, y1-4), (x2+4, y2+4), border_color, 8)
-    result = cv2.addWeighted(result, 0.75, overlay, 0.25, 0)
+    # Пурпурная рамка
+    color = (255, 0, 220)
+    cv2.rectangle(result, (x1, y1), (x2, y2), color, 3)
+
+    # Glow рамки
+    glow_layer = result.copy()
+    cv2.rectangle(glow_layer, (x1-5, y1-5), (x2+5, y2+5), color, 10)
+    cv2.rectangle(glow_layer, (x1-10, y1-10), (x2+10, y2+10), color, 6)
+    result = cv2.addWeighted(result, 0.7, glow_layer, 0.3, 0)
+
     return result
 
 
@@ -63,19 +91,19 @@ def process_video(input_path: str, output_path: str):
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    tmp_video = input_path + "_noaudio.mp4"
+    tmp_video = input_path + "_tmp.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(tmp_video, fourcc, fps, (w, h))
 
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=2,
-        min_detection_confidence=0.6,
+        min_detection_confidence=0.55,
         min_tracking_confidence=0.5,
     )
 
     prev_rect = None
-    smooth = 0.6
+    smooth = 0.5
 
     while True:
         ret, frame = cap.read()
@@ -85,20 +113,26 @@ def process_video(input_path: str, output_path: str):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb)
 
-        index_tips = []
+        # Собираем точки обеих рук
+        all_points = []  # список (ix,iy,tx,ty) для каждой руки с L-жестом
+
         if results.multi_hand_landmarks:
             for hand_lm in results.multi_hand_landmarks:
-                if is_l_gesture(hand_lm):
-                    tip = hand_lm.landmark[INDEX_TIP]
-                    index_tips.append((int(tip.x * w), int(tip.y * h)))
+                pts = get_hand_points(hand_lm, w, h)
+                if pts is not None:
+                    all_points.append(pts)
 
-        if len(index_tips) == 2:
-            p1, p2 = index_tips
-            rx1 = min(p1[0], p2[0])
-            ry1 = min(p1[1], p2[1])
-            rx2 = max(p1[0], p2[0])
-            ry2 = max(p1[1], p2[1])
+        if len(all_points) == 2:
+            # Берём все 4 точки: 2 указательных + 2 больших
+            pts_flat = [all_points[0][0], all_points[0][1],
+                        all_points[1][0], all_points[1][1]]
+            xs = [p[0] for p in pts_flat]
+            ys = [p[1] for p in pts_flat]
 
+            rx1, ry1 = min(xs), min(ys)
+            rx2, ry2 = max(xs), max(ys)
+
+            # Сглаживание
             if prev_rect is None:
                 prev_rect = (rx1, ry1, rx2, ry2)
             else:
@@ -108,7 +142,7 @@ def process_video(input_path: str, output_path: str):
                 ry2 = int(prev_rect[3] * (1-smooth) + ry2 * smooth)
                 prev_rect = (rx1, ry1, rx2, ry2)
 
-            frame = apply_rect_effect(frame, rx1, ry1, rx2, ry2)
+            frame = apply_effect(frame, rx1, ry1, rx2, ry2)
         else:
             prev_rect = None
 
@@ -118,22 +152,16 @@ def process_video(input_path: str, output_path: str):
     out.release()
     hands.close()
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", tmp_video,
-        "-i", input_path,
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-shortest",
-        "-pix_fmt", "yuv420p",
-        output_path
-    ]
+    # Склеиваем с аудио
+    cmd = ["ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
+           "-c:v", "libx264", "-c:a", "aac",
+           "-map", "0:v:0", "-map", "1:a:0",
+           "-shortest", "-pix_fmt", "yuv420p", output_path]
     r = subprocess.run(cmd, capture_output=True)
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-        cmd2 = ["ffmpeg", "-y", "-i", tmp_video, "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
+        cmd2 = ["ffmpeg", "-y", "-i", tmp_video,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
         subprocess.run(cmd2, capture_output=True)
 
     if os.path.exists(tmp_video):
@@ -168,7 +196,9 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Отправь кружок с L-жестом двумя руками — получишь пурпурный эффект внутри рамки 🟣"
+        "👋 Отправь кружок!\n\n"
+        "🤙 Держи обе руки L-жестом (указательный вверх + большой в сторону).\n"
+        "Прямоугольник строится между всеми 4 пальцами."
     )
 
 
