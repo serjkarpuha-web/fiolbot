@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -22,9 +22,6 @@ mp_hands = mp.solutions.hands
 
 INDEX_TIP = 8
 THUMB_TIP = 4
-
-WAITING_TEXT = 1
-WAITING_COLOR = 2
 
 COLORS = {
     "purple": {"name": "🟣 Пурпурный", "bgr": (255, 0, 200)},
@@ -451,7 +448,7 @@ async def run_and_send(update, context, input_path, custom_text=None, color_bgr=
 MAX_DURATION_SECONDS = 60  # ограничение на длину видео — длиннее будет обрабатываться слишком долго
 
 
-async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
 
     if msg.video_note.duration and msg.video_note.duration > MAX_DURATION_SECONDS:
@@ -459,7 +456,7 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"⚠️ Видео слишком длинное ({msg.video_note.duration} сек). "
             f"Максимум {MAX_DURATION_SECONDS} секунд — иначе обработка займёт слишком много времени."
         )
-        return ConversationHandler.END
+        return
 
     file = await context.bot.get_file(msg.video_note.file_id)
 
@@ -469,6 +466,7 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["pending_input_path"] = input_path
     context.user_data["media_kind"] = "video_note"
+    context.user_data["awaiting_text"] = False
     context.user_data["video_note_meta"] = {
         "duration": msg.video_note.duration,
         "length": msg.video_note.length,
@@ -476,10 +474,9 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     keyboard = build_color_keyboard()
     await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
-    return WAITING_COLOR
 
 
-async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
 
     if msg.video.duration and msg.video.duration > MAX_DURATION_SECONDS:
@@ -487,7 +484,7 @@ async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYP
             f"⚠️ Видео слишком длинное ({msg.video.duration} сек). "
             f"Максимум {MAX_DURATION_SECONDS} секунд — иначе обработка займёт слишком много времени."
         )
-        return ConversationHandler.END
+        return
 
     file = await context.bot.get_file(msg.video.file_id)
 
@@ -497,10 +494,10 @@ async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data["pending_input_path"] = input_path
     context.user_data["media_kind"] = "video"
+    context.user_data["awaiting_text"] = False
 
     keyboard = build_color_keyboard()
     await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
-    return WAITING_COLOR
 
 
 def build_color_keyboard():
@@ -516,7 +513,7 @@ def build_color_keyboard():
     return InlineKeyboardMarkup(buttons)
 
 
-async def handle_color_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_color_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -529,10 +526,9 @@ async def handle_color_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("🚫 Без текста", callback_data="no_text")],
     ])
     await query.edit_message_text("Хочешь добавить текст внутрь рамки?", reply_markup=keyboard)
-    return WAITING_TEXT
 
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_text_choice_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -540,42 +536,48 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     color_bgr = context.user_data.get("chosen_color", (255, 0, 200))
 
     if not input_path or not os.path.exists(input_path):
-        await query.edit_message_text("❌ Файл не найден, отправь кружок заново")
-        return ConversationHandler.END
+        await query.edit_message_text("❌ Файл не найден, отправь кружок/видео заново")
+        return
 
     if query.data == "no_text":
+        context.user_data["awaiting_text"] = False
         await query.edit_message_text("🔄 Обрабатываю без текста...")
         await run_and_send(update, context, input_path, custom_text=None, color_bgr=color_bgr)
-        return ConversationHandler.END
 
     elif query.data == "add_text":
+        context.user_data["awaiting_text"] = True
         await query.edit_message_text("✏️ Напиши текст на любом языке — он появится в рамке:")
-        return WAITING_TEXT
 
 
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Реагируем на обычный текст только если реально ждём текст для рамки —
+    # иначе бот будет пытаться обработать любое случайное сообщение пользователя
+    if not context.user_data.get("awaiting_text"):
+        return
+
     text = update.message.text.strip()
     input_path = context.user_data.get("pending_input_path")
     color_bgr = context.user_data.get("chosen_color", (255, 0, 200))
 
     if not input_path or not os.path.exists(input_path):
-        await update.message.reply_text("❌ Файл не найден, отправь кружок заново")
-        return ConversationHandler.END
+        await update.message.reply_text("❌ Файл не найден, отправь кружок/видео заново")
+        context.user_data["awaiting_text"] = False
+        return
 
     if len(text) > 25:
         await update.message.reply_text("⚠️ Текст слишком длинный (максимум 25 символов), напиши короче:")
-        return WAITING_TEXT
+        return
 
+    context.user_data["awaiting_text"] = False
     await run_and_send(update, context, input_path, custom_text=text, color_bgr=color_bgr)
-    return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_path = context.user_data.get("pending_input_path")
     if input_path and os.path.exists(input_path):
         os.remove(input_path)
+    context.user_data.clear()
     await update.message.reply_text("Отменено.")
-    return ConversationHandler.END
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -590,23 +592,13 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.VIDEO_NOTE, handle_video_note),
-            MessageHandler(filters.VIDEO, handle_regular_video),
-        ],
-        states={
-            WAITING_COLOR: [CallbackQueryHandler(handle_color_choice, pattern="^color_")],
-            WAITING_TEXT: [
-                CallbackQueryHandler(handle_button),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
     app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_regular_video))
+    app.add_handler(CallbackQueryHandler(handle_color_choice, pattern="^color_"))
+    app.add_handler(CallbackQueryHandler(handle_text_choice_buttons, pattern="^(add_text|no_text)$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
     logger.info("Бот запущен!")
     app.run_polling()
@@ -614,6 +606,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
