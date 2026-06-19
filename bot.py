@@ -89,17 +89,16 @@ def preprocess_for_detection(frame):
 
 def detect_hands_multiscale(hands_detector, frame, w, h):
     """
-    Пытается найти руки с L-жестом на нескольких масштабах кадра,
+    Ищет руки с L-жестом на нескольких масштабах кадра,
     чтобы ловить как крупные (близко), так и мелкие (далеко) руки.
-    Возвращает список (index_tip, thumb_tip) точек уже в координатах оригинального кадра.
+    Собирает ВСЕ найденные руки (не останавливается на первых двух),
+    чтобы потом можно было выбрать лучшую пару среди нескольких людей в кадре.
+    Возвращает список (index_tip, thumb_tip) в координатах оригинального кадра.
     """
     scales = [1.0, 1.5, 0.7]
     found = []
 
     for scale in scales:
-        if len(found) >= 2:
-            break
-
         if scale == 1.0:
             scaled = frame
             sw, sh = w, h
@@ -116,14 +115,70 @@ def detect_hands_multiscale(hands_detector, frame, w, h):
                 pts = get_hand_points(hand_lm, sw, sh)
                 if pts is not None:
                     idx_pt, thm_pt = pts
-                    # Переводим обратно в координаты оригинала
                     idx_orig = (int(idx_pt[0] / scale), int(idx_pt[1] / scale))
                     thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
                     found.append((idx_orig, thm_orig))
-                    if len(found) >= 2:
-                        break
+
+        # Если уже нашли достаточно кандидатов — не гоняем остальные масштабы
+        if len(found) >= 4:
+            break
 
     return found
+
+
+def dedupe_hands(hand_points, dist_threshold=40):
+    """Убирает дубликаты одной и той же руки, найденной на разных масштабах"""
+    unique = []
+    for idx_pt, thm_pt in hand_points:
+        is_dup = False
+        for u_idx, u_thm in unique:
+            if (abs(idx_pt[0] - u_idx[0]) < dist_threshold and
+                    abs(idx_pt[1] - u_idx[1]) < dist_threshold):
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append((idx_pt, thm_pt))
+    return unique
+
+
+def pick_best_pair(hand_points, prev_center=None):
+    """
+    Если найдено больше 2 рук с L-жестом (несколько людей в кадре),
+    выбирает пару, которая:
+    1) Образует валидный (не вырожденный) четырёхугольник
+    2) Если есть прошлая позиция — ближайшую к ней (стабильность между кадрами)
+    3) Иначе — пару с наибольшей площадью получившейся фигуры
+    """
+    if len(hand_points) < 2:
+        return None
+    if len(hand_points) == 2:
+        return hand_points[0], hand_points[1]
+
+    from itertools import combinations
+    candidates = []
+    for a, b in combinations(hand_points, 2):
+        try:
+            quad = make_quad(a, b)
+            area = cv2.contourArea(quad)
+            if area < 400:  # слишком маленький/вырожденный — пропускаем
+                continue
+            center = quad.mean(axis=0)
+            candidates.append((area, center, a, b))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    if prev_center is not None:
+        # Выбираем пару с центром ближе к прошлому положению
+        candidates.sort(key=lambda c: np.linalg.norm(c[1] - prev_center))
+    else:
+        # Иначе берём самую большую фигуру
+        candidates.sort(key=lambda c: -c[0])
+
+    _, _, a, b = candidates[0]
+    return a, b
 
 
 def make_quad(hand_a, hand_b):
@@ -243,37 +298,59 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
     )
 
     prev_pts = None
-    smooth = 0.4
+    prev_center = None
+    smooth = 0.25          # ниже = плавнее (было 0.4)
     miss_count = 0
-    MAX_MISS = 3  # сколько кадров держим прошлую фигуру если руки временно потерялись
+    MAX_MISS = 5           # дольше держим фигуру при коротких потерях трекинга
+    MAX_JUMP = 220         # макс. смещение центра между кадрами (px) — защита от рывков/чужих рук
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Улучшаем кадр перед детекцией (но эффект применяем на оригинальный frame)
         enhanced = preprocess_for_detection(frame)
-        hand_points = detect_hands_multiscale(hands, enhanced, w, h)
+        raw_points = detect_hands_multiscale(hands, enhanced, w, h)
+        raw_points = dedupe_hands(raw_points)
 
-        if len(hand_points) == 2:
+        pair = pick_best_pair(raw_points, prev_center)
+
+        valid_update = False
+        if pair is not None:
             try:
-                quad = make_quad(hand_points[0], hand_points[1])
-                if prev_pts is None:
-                    prev_pts = quad.astype(np.float32)
-                else:
-                    prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
-                frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
-                miss_count = 0
+                quad = make_quad(pair[0], pair[1])
+                area = cv2.contourArea(quad)
+                new_center = quad.mean(axis=0)
+
+                if area >= 400:
+                    if prev_center is None:
+                        valid_update = True
+                    else:
+                        jump = np.linalg.norm(new_center - prev_center)
+                        # Принимаем точку только если скачок разумный,
+                        # либо руки давно не отслеживались (тогда доверяем новой позиции)
+                        if jump <= MAX_JUMP or miss_count >= 2:
+                            valid_update = True
+
+                if valid_update:
+                    if prev_pts is None:
+                        prev_pts = quad.astype(np.float32)
+                    else:
+                        prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
+                    prev_center = prev_pts.mean(axis=0)
+                    frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
+                    miss_count = 0
             except Exception:
-                pass
-        else:
+                valid_update = False
+
+        if not valid_update:
             miss_count += 1
             if prev_pts is not None and miss_count <= MAX_MISS:
-                # Держим последнюю известную фигуру короткое время (борьба с дрожанием детекции)
+                # Плавно держим последнюю известную фигуру при коротких потерях трекинга
                 frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
             else:
                 prev_pts = None
+                prev_center = None
 
         out.write(frame)
 
@@ -478,5 +555,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
