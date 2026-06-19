@@ -54,7 +54,8 @@ FONT_PATH = find_font()
 
 def get_hand_points(hand_landmarks, w, h):
     lm = hand_landmarks.landmark
-    index_up = lm[8].y < lm[6].y < lm[5].y
+    # Более надёжная проверка L-жеста с запасом (используем длины фаланг, не только y)
+    index_up = (lm[8].y < lm[6].y) and (lm[6].y < lm[5].y)
     middle_down = lm[12].y > lm[10].y
     ring_down   = lm[16].y > lm[14].y
     pinky_down  = lm[20].y > lm[18].y
@@ -65,6 +66,64 @@ def get_hand_points(hand_landmarks, w, h):
     tx = int(lm[THUMB_TIP].x * w)
     ty = int(lm[THUMB_TIP].y * h)
     return (ix, iy), (tx, ty)
+
+
+def preprocess_for_detection(frame):
+    """
+    Улучшает кадр для более точного распознавания рук:
+    - CLAHE для контраста (помогает в плохом освещении)
+    - Лёгкая резкость
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # Лёгкая нерезкая маска для повышения детализации краёв пальцев
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), 3)
+    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+    return sharpened
+
+
+def detect_hands_multiscale(hands_detector, frame, w, h):
+    """
+    Пытается найти руки с L-жестом на нескольких масштабах кадра,
+    чтобы ловить как крупные (близко), так и мелкие (далеко) руки.
+    Возвращает список (index_tip, thumb_tip) точек уже в координатах оригинального кадра.
+    """
+    scales = [1.0, 1.5, 0.7]
+    found = []
+
+    for scale in scales:
+        if len(found) >= 2:
+            break
+
+        if scale == 1.0:
+            scaled = frame
+            sw, sh = w, h
+        else:
+            sw, sh = int(w * scale), int(h * scale)
+            scaled = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
+
+        rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = hands_detector.process(rgb)
+
+        if results.multi_hand_landmarks:
+            for hand_lm in results.multi_hand_landmarks:
+                pts = get_hand_points(hand_lm, sw, sh)
+                if pts is not None:
+                    idx_pt, thm_pt = pts
+                    # Переводим обратно в координаты оригинала
+                    idx_orig = (int(idx_pt[0] / scale), int(idx_pt[1] / scale))
+                    thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
+                    found.append((idx_orig, thm_orig))
+                    if len(found) >= 2:
+                        break
+
+    return found
 
 
 def make_quad(hand_a, hand_b):
@@ -173,32 +232,29 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(tmp_video, fourcc, fps, (w, h))
 
-    # Снижаем пороги уверенности — руки видны с любого расстояния, даже маленькие в кадре
+    # Максимальная точность: model_complexity=1 (полная модель), низкий порог уверенности
+    # чтобы ловить руки на разном расстоянии, в разном освещении
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=2,
-        min_detection_confidence=0.35,
-        min_tracking_confidence=0.3,
+        min_detection_confidence=0.25,
+        min_tracking_confidence=0.25,
         model_complexity=1,
     )
 
     prev_pts = None
-    smooth = 0.45
+    smooth = 0.4
+    miss_count = 0
+    MAX_MISS = 3  # сколько кадров держим прошлую фигуру если руки временно потерялись
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
-
-        hand_points = []
-        if results.multi_hand_landmarks:
-            for hand_lm in results.multi_hand_landmarks:
-                pts = get_hand_points(hand_lm, w, h)
-                if pts is not None:
-                    hand_points.append(pts)
+        # Улучшаем кадр перед детекцией (но эффект применяем на оригинальный frame)
+        enhanced = preprocess_for_detection(frame)
+        hand_points = detect_hands_multiscale(hands, enhanced, w, h)
 
         if len(hand_points) == 2:
             try:
@@ -208,10 +264,16 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
                 else:
                     prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
                 frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
+                miss_count = 0
             except Exception:
                 pass
         else:
-            prev_pts = None
+            miss_count += 1
+            if prev_pts is not None and miss_count <= MAX_MISS:
+                # Держим последнюю известную фигуру короткое время (борьба с дрожанием детекции)
+                frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
+            else:
+                prev_pts = None
 
         out.write(frame)
 
@@ -416,4 +478,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
