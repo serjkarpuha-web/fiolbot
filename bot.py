@@ -87,15 +87,14 @@ def preprocess_for_detection(frame):
     return sharpened
 
 
-def detect_hands_multiscale(hands_detector, frame, w, h):
+def detect_hands_multiscale(hands_detector, frame, w, h, full_scan=True):
     """
-    Ищет руки с L-жестом на нескольких масштабах кадра,
-    чтобы ловить как крупные (близко), так и мелкие (далеко) руки.
-    Собирает ВСЕ найденные руки (не останавливается на первых двух),
-    чтобы потом можно было выбрать лучшую пару среди нескольких людей в кадре.
+    Ищет руки с L-жестом.
+    Если full_scan=True — проверяет несколько масштабов (для надёжного первого захвата).
+    Если full_scan=False — только основной масштаб (быстрый путь, когда руки уже отслеживаются).
     Возвращает список (index_tip, thumb_tip) в координатах оригинального кадра.
     """
-    scales = [1.0, 1.5, 0.7]
+    scales = [1.0, 1.5, 0.7] if full_scan else [1.0]
     found = []
 
     for scale in scales:
@@ -119,7 +118,6 @@ def detect_hands_multiscale(hands_detector, frame, w, h):
                     thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
                     found.append((idx_orig, thm_orig))
 
-        # Если уже нашли достаточно кандидатов — не гоняем остальные масштабы
         if len(found) >= 4:
             break
 
@@ -299,18 +297,28 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
 
     prev_pts = None
     prev_center = None
-    smooth = 0.25          # ниже = плавнее (было 0.4)
+    smooth = 0.25
     miss_count = 0
-    MAX_MISS = 5           # дольше держим фигуру при коротких потерях трекинга
-    MAX_JUMP = 220         # макс. смещение центра между кадрами (px) — защита от рывков/чужих рук
+    MAX_MISS = 5
+    MAX_JUMP = 220
+
+    frame_idx = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        enhanced = preprocess_for_detection(frame)
-        raw_points = detect_hands_multiscale(hands, enhanced, w, h)
+        # Полное многомасштабное сканирование только когда руки потеряны
+        # (первый кадр, или после MAX_MISS промахов) — иначе быстрый путь на 1 масштабе.
+        need_full_scan = (prev_pts is None) or (miss_count > 0)
+
+        if need_full_scan:
+            search_frame = preprocess_for_detection(frame)
+        else:
+            search_frame = frame
+
+        raw_points = detect_hands_multiscale(hands, search_frame, w, h, full_scan=need_full_scan)
         raw_points = dedupe_hands(raw_points)
 
         pair = pick_best_pair(raw_points, prev_center)
@@ -327,8 +335,6 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
                         valid_update = True
                     else:
                         jump = np.linalg.norm(new_center - prev_center)
-                        # Принимаем точку только если скачок разумный,
-                        # либо руки давно не отслеживались (тогда доверяем новой позиции)
                         if jump <= MAX_JUMP or miss_count >= 2:
                             valid_update = True
 
@@ -346,70 +352,132 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
         if not valid_update:
             miss_count += 1
             if prev_pts is not None and miss_count <= MAX_MISS:
-                # Плавно держим последнюю известную фигуру при коротких потерях трекинга
                 frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
             else:
                 prev_pts = None
                 prev_center = None
 
         out.write(frame)
+        frame_idx += 1
 
     cap.release()
     out.release()
     hands.close()
 
+    # Проверяем что промежуточное видео реально записалось и не пустое
+    if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 1000:
+        logger.error("Промежуточное видео не создалось или пустое")
+        return False
+
     cmd = ["ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
            "-c:v", "libx264", "-c:a", "aac",
            "-map", "0:v:0", "-map", "1:a:0",
            "-shortest", "-pix_fmt", "yuv420p", output_path]
-    subprocess.run(cmd, capture_output=True)
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg (видео+аудио) превысил таймаут")
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
         cmd2 = ["ffmpeg", "-y", "-i", tmp_video,
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
-        subprocess.run(cmd2, capture_output=True)
+        try:
+            subprocess.run(cmd2, capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            logger.error("ffmpeg (только видео) превысил таймаут")
 
     if os.path.exists(tmp_video):
         os.remove(tmp_video)
 
+    # Финальная проверка целостности готового файла через ffprobe —
+    # чтобы не отправить пользователю битое видео
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+        return False
+
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "csv=p=0", output_path],
+            capture_output=True, text=True, timeout=30
+        )
+        if probe.returncode != 0 or not probe.stdout.strip():
+            logger.error(f"ffprobe не подтвердил целостность файла: {probe.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки файла через ffprobe: {e}")
+        return False
+
+    return True
+
 
 async def run_and_send(update, context, input_path, custom_text=None, color_bgr=(255, 0, 200)):
     msg = update.effective_message
-    await msg.reply_text("🔄 Обрабатываю...")
+    status_msg = await msg.reply_text("🔄 Обрабатываю видео, это может занять некоторое время...")
     output_path = input_path + "_out.mp4"
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, process_video, input_path, output_path, custom_text, color_bgr)
-        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-            await msg.reply_text("❌ Не удалось обработать")
+        success = await loop.run_in_executor(
+            None, process_video, input_path, output_path, custom_text, color_bgr
+        )
+
+        if not success:
+            await status_msg.edit_text(
+                "❌ Не удалось обработать видео. Возможно, оно слишком длинное/тяжёлое — "
+                "попробуй покороче (до 15-20 секунд) или с меньшим разрешением."
+            )
             return
 
         media_kind = context.user_data.get("media_kind", "video_note")
 
-        if media_kind == "video_note":
-            vn = context.user_data.get("video_note_meta", {})
-            with open(output_path, "rb") as f:
-                await context.bot.send_video_note(
-                    chat_id=msg.chat_id,
-                    video_note=f,
-                    duration=vn.get("duration"),
-                    length=vn.get("length"),
-                )
-        else:
-            with open(output_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=msg.chat_id,
-                    video=f,
-                    supports_streaming=True,
-                )
+        try:
+            if media_kind == "video_note":
+                vn = context.user_data.get("video_note_meta", {})
+                with open(output_path, "rb") as f:
+                    await context.bot.send_video_note(
+                        chat_id=msg.chat_id,
+                        video_note=f,
+                        duration=vn.get("duration"),
+                        length=vn.get("length"),
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60,
+                    )
+            else:
+                with open(output_path, "rb") as f:
+                    await context.bot.send_video(
+                        chat_id=msg.chat_id,
+                        video=f,
+                        supports_streaming=True,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60,
+                    )
+            await status_msg.delete()
+        except Exception as e:
+            logger.error(f"Ошибка отправки видео: {e}", exc_info=True)
+            await status_msg.edit_text(f"❌ Готово, но не получилось отправить: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка обработки видео: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
     finally:
         for p in (input_path, output_path):
             if os.path.exists(p):
                 os.remove(p)
 
 
+MAX_DURATION_SECONDS = 60  # ограничение на длину видео — длиннее будет обрабатываться слишком долго
+
+
 async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
+
+    if msg.video_note.duration and msg.video_note.duration > MAX_DURATION_SECONDS:
+        await msg.reply_text(
+            f"⚠️ Видео слишком длинное ({msg.video_note.duration} сек). "
+            f"Максимум {MAX_DURATION_SECONDS} секунд — иначе обработка займёт слишком много времени."
+        )
+        return ConversationHandler.END
+
     file = await context.bot.get_file(msg.video_note.file_id)
 
     tmp_dir = tempfile.mkdtemp()
@@ -430,6 +498,14 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
+
+    if msg.video.duration and msg.video.duration > MAX_DURATION_SECONDS:
+        await msg.reply_text(
+            f"⚠️ Видео слишком длинное ({msg.video.duration} сек). "
+            f"Максимум {MAX_DURATION_SECONDS} секунд — иначе обработка займёт слишком много времени."
+        )
+        return ConversationHandler.END
+
     file = await context.bot.get_file(msg.video.file_id)
 
     tmp_dir = tempfile.mkdtemp()
