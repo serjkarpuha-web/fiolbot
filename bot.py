@@ -23,6 +23,17 @@ INDEX_TIP = 8
 THUMB_TIP = 4
 
 WAITING_TEXT = 1
+WAITING_COLOR = 2
+
+# Цвета в формате BGR (OpenCV)
+COLORS = {
+    "purple": {"name": "🟣 Пурпурный", "bgr": (255, 0, 200)},
+    "blue":   {"name": "🔵 Синий",     "bgr": (255, 100, 0)},
+    "green":  {"name": "🟢 Зелёный",   "bgr": (60, 255, 60)},
+    "red":    {"name": "🔴 Красный",   "bgr": (40, 30, 230)},
+    "yellow": {"name": "🟡 Жёлтый",    "bgr": (40, 230, 230)},
+    "white":  {"name": "⚪ Белый",     "bgr": (240, 240, 240)},
+}
 
 
 def get_hand_points(hand_landmarks, w, h):
@@ -58,13 +69,11 @@ def make_quad(hand_a, hand_b):
 
 
 def draw_glow_text(img, text, center, font_scale, color, thickness=2):
-    """Рисует просвечивающий текст с glow-эффектом по центру"""
     font = cv2.FONT_HERSHEY_DUPLEX
     (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     x = int(center[0] - tw / 2)
     y = int(center[1] + th / 2)
 
-    # Слой для glow
     overlay = np.zeros_like(img)
     cv2.putText(overlay, text, (x, y), font, font_scale, color, thickness + 4, cv2.LINE_AA)
     overlay = cv2.GaussianBlur(overlay, (15, 15), 0)
@@ -74,7 +83,7 @@ def draw_glow_text(img, text, center, font_scale, color, thickness=2):
     return img
 
 
-def apply_quad_effect(frame, pts, text=None):
+def apply_quad_effect(frame, pts, text=None, color_bgr=(255, 0, 200)):
     H, W = frame.shape[:2]
 
     mask = np.zeros((H, W), dtype=np.uint8)
@@ -83,36 +92,36 @@ def apply_quad_effect(frame, pts, text=None):
 
     dark = (frame * 0.06).astype(np.uint8)
 
+    # Тонируем инвертированное изображение в выбранный цвет
     inv = cv2.bitwise_not(frame)
-    purple = inv.copy()
-    purple[:, :, 1] = 0
-    purple[:, :, 2] = (purple[:, :, 2] * 0.7).astype(np.uint8)
+    gray_inv = cv2.cvtColor(inv, cv2.COLOR_BGR2GRAY)
+    tinted = np.zeros_like(frame)
+    for i in range(3):
+        tinted[:, :, i] = (gray_inv.astype(np.float32) * (color_bgr[i] / 255.0)).astype(np.uint8)
 
-    glow = cv2.GaussianBlur(purple, (31, 31), 0)
+    glow = cv2.GaussianBlur(tinted, (31, 31), 0)
 
-    effect = cv2.addWeighted(dark, 0.15, purple, 0.55, 0)
+    effect = cv2.addWeighted(dark, 0.15, tinted, 0.55, 0)
     effect = cv2.addWeighted(effect, 1.0, glow, 0.45, 0)
 
-    # Текст внутри эффекта (до наложения маски, чтобы он тоже обрезался по форме)
     if text:
         cx = int(pts[:, 0].mean())
         cy = int(pts[:, 1].mean())
         quad_w = max(pts[:, 0]) - min(pts[:, 0])
         font_scale = max(0.5, min(1.6, quad_w / (len(text) * 28 + 1)))
-        draw_glow_text(effect, text, (cx, cy), font_scale, (40, 30, 230))
+        draw_glow_text(effect, text, (cx, cy), font_scale, color_bgr)
 
     result = (frame.astype(np.float32) * (1 - mask3) + effect.astype(np.float32) * mask3).astype(np.uint8)
 
-    color = (255, 0, 200)
     glow_layer = result.copy()
-    cv2.polylines(glow_layer, [pts], True, color, 14)
+    cv2.polylines(glow_layer, [pts], True, color_bgr, 14)
     result = cv2.addWeighted(result, 0.72, glow_layer, 0.28, 0)
-    cv2.polylines(result, [pts], True, color, 2)
+    cv2.polylines(result, [pts], True, color_bgr, 2)
 
     return result
 
 
-def process_video(input_path: str, output_path: str, custom_text=None):
+def process_video(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200)):
     cap = cv2.VideoCapture(input_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -154,7 +163,7 @@ def process_video(input_path: str, output_path: str, custom_text=None):
                     prev_pts = quad.astype(np.float32)
                 else:
                     prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
-                frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text)
+                frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
             except Exception:
                 pass
         else:
@@ -181,13 +190,13 @@ def process_video(input_path: str, output_path: str, custom_text=None):
         os.remove(tmp_video)
 
 
-async def run_and_send(update, context, input_path, custom_text=None):
+async def run_and_send(update, context, input_path, custom_text=None, color_bgr=(255, 0, 200)):
     msg = update.effective_message
     await msg.reply_text("🔄 Обрабатываю...")
     output_path = input_path + "_out.mp4"
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, process_video, input_path, output_path, custom_text)
+        await loop.run_in_executor(None, process_video, input_path, output_path, custom_text, color_bgr)
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
             await msg.reply_text("❌ Не удалось обработать")
             return
@@ -219,14 +228,37 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "length": msg.video_note.length,
     }
 
+    keyboard = build_color_keyboard()
+    await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
+    return WAITING_COLOR
+
+
+def build_color_keyboard():
+    buttons = []
+    row = []
+    for key, val in COLORS.items():
+        row.append(InlineKeyboardButton(val["name"], callback_data=f"color_{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def handle_color_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    color_key = query.data.replace("color_", "")
+    color_bgr = COLORS.get(color_key, COLORS["purple"])["bgr"]
+    context.user_data["chosen_color"] = color_bgr
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✍️ Добавить текст", callback_data="add_text")],
         [InlineKeyboardButton("🚫 Без текста", callback_data="no_text")],
     ])
-    await msg.reply_text(
-        "Хочешь добавить текст внутрь рамки?",
-        reply_markup=keyboard
-    )
+    await query.edit_message_text("Хочешь добавить текст внутрь рамки?", reply_markup=keyboard)
     return WAITING_TEXT
 
 
@@ -235,13 +267,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.answer()
 
     input_path = context.user_data.get("pending_input_path")
+    color_bgr = context.user_data.get("chosen_color", (255, 0, 200))
+
     if not input_path or not os.path.exists(input_path):
         await query.edit_message_text("❌ Файл не найден, отправь кружок заново")
         return ConversationHandler.END
 
     if query.data == "no_text":
         await query.edit_message_text("🔄 Обрабатываю без текста...")
-        await run_and_send(update, context, input_path, custom_text=None)
+        await run_and_send(update, context, input_path, custom_text=None, color_bgr=color_bgr)
         return ConversationHandler.END
 
     elif query.data == "add_text":
@@ -252,6 +286,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     input_path = context.user_data.get("pending_input_path")
+    color_bgr = context.user_data.get("chosen_color", (255, 0, 200))
 
     if not input_path or not os.path.exists(input_path):
         await update.message.reply_text("❌ Файл не найден, отправь кружок заново")
@@ -261,7 +296,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("⚠️ Текст слишком длинный (максимум 20 символов), напиши короче:")
         return WAITING_TEXT
 
-    await run_and_send(update, context, input_path, custom_text=text)
+    await run_and_send(update, context, input_path, custom_text=text, color_bgr=color_bgr)
     return ConversationHandler.END
 
 
@@ -277,7 +312,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Отправь кружок с L-жестом двумя руками!\n\n"
         "🤙 Указательный вверх + большой в сторону — обе руки.\n"
-        "После обработки спрошу — добавить текст внутрь рамки или нет.\n\n"
+        "После этого выберешь цвет эффекта и можно добавить текст.\n\n"
         "/cancel — отменить текущую операцию"
     )
 
@@ -288,6 +323,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.VIDEO_NOTE, handle_video_note)],
         states={
+            WAITING_COLOR: [CallbackQueryHandler(handle_color_choice, pattern="^color_")],
             WAITING_TEXT: [
                 CallbackQueryHandler(handle_button),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input),
@@ -305,5 +341,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
