@@ -51,11 +51,13 @@ FONT_PATH = find_font()
 
 def get_hand_points(hand_landmarks, w, h):
     lm = hand_landmarks.landmark
-    # Более надёжная проверка L-жеста с запасом (используем длины фаланг, не только y)
-    index_up = (lm[8].y < lm[6].y) and (lm[6].y < lm[5].y)
-    middle_down = lm[12].y > lm[10].y
-    ring_down   = lm[16].y > lm[14].y
-    pinky_down  = lm[20].y > lm[18].y
+    # Чуть более мягкая проверка L-жеста (с небольшим запасом),
+    # чтобы естественное дрожание руки/неидеальный жест не "выбивали" детекцию каждый второй кадр
+    margin = 0.01
+    index_up = (lm[8].y < lm[6].y + margin) and (lm[6].y < lm[5].y + margin)
+    middle_down = lm[12].y > lm[10].y - margin
+    ring_down   = lm[16].y > lm[14].y - margin
+    pinky_down  = lm[20].y > lm[18].y - margin
     if not (index_up and middle_down and ring_down and pinky_down):
         return None
     ix = int(lm[INDEX_TIP].x * w)
@@ -216,9 +218,9 @@ def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
     draw_glow.text((x, y), text, font=font, fill=(*color_rgb, 255))
 
     glow_np = cv2.cvtColor(np.array(glow_img), cv2.COLOR_RGBA2BGRA)
-    glow_blur = cv2.GaussianBlur(glow_np, (15, 15), 0)
+    glow_blur = cv2.GaussianBlur(glow_np, (9, 9), 0)
     glow_bgr = glow_blur[:, :, :3]
-    glow_alpha = (glow_blur[:, :, 3:4].astype(np.float32) / 255.0) * 0.8
+    glow_alpha = (glow_blur[:, :, 3:4].astype(np.float32) / 255.0) * 0.5
 
     img_bgr[:] = (img_bgr.astype(np.float32) * (1 - glow_alpha) +
                   glow_bgr.astype(np.float32) * glow_alpha).astype(np.uint8)
@@ -283,17 +285,17 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=2,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
-        model_complexity=0,  # лёгкая модель — быстрее, жест L всё равно простой для распознавания
+        min_detection_confidence=0.3,
+        min_tracking_confidence=0.3,
+        model_complexity=1,  # точная модель — важнее для стабильного распознавания L-жеста, чем скорость
     )
 
     prev_pts = None
     prev_center = None
-    smooth = 0.35       # плавное, но отзывчивое сглаживание — одинаково для кружков и видео
+    smooth = 0.35
     miss_count = 0
-    MAX_MISS = 6         # держим фигуру на месте при коротких потерях трекинга (~0.2-0.3 сек)
-    MAX_JUMP = 260        # защита от рывков на чужую руку/шум
+    MAX_MISS = 10         # держим фигуру на месте дольше при коротких потерях трекинга (~0.3-0.4 сек)
+    MAX_JUMP = 260
 
     while True:
         ret, frame = cap.read()
@@ -606,6 +608,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
