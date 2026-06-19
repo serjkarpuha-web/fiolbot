@@ -244,14 +244,25 @@ async def run_and_send(update, context, input_path, custom_text=None, color_bgr=
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
             await msg.reply_text("❌ Не удалось обработать")
             return
-        vn = context.user_data.get("video_note_meta", {})
-        with open(output_path, "rb") as f:
-            await context.bot.send_video_note(
-                chat_id=msg.chat_id,
-                video_note=f,
-                duration=vn.get("duration"),
-                length=vn.get("length"),
-            )
+
+        media_kind = context.user_data.get("media_kind", "video_note")
+
+        if media_kind == "video_note":
+            vn = context.user_data.get("video_note_meta", {})
+            with open(output_path, "rb") as f:
+                await context.bot.send_video_note(
+                    chat_id=msg.chat_id,
+                    video_note=f,
+                    duration=vn.get("duration"),
+                    length=vn.get("length"),
+                )
+        else:
+            with open(output_path, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=msg.chat_id,
+                    video=f,
+                    supports_streaming=True,
+                )
     finally:
         for p in (input_path, output_path):
             if os.path.exists(p):
@@ -267,10 +278,27 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await file.download_to_drive(input_path)
 
     context.user_data["pending_input_path"] = input_path
+    context.user_data["media_kind"] = "video_note"
     context.user_data["video_note_meta"] = {
         "duration": msg.video_note.duration,
         "length": msg.video_note.length,
     }
+
+    keyboard = build_color_keyboard()
+    await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
+    return WAITING_COLOR
+
+
+async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.message
+    file = await context.bot.get_file(msg.video.file_id)
+
+    tmp_dir = tempfile.mkdtemp()
+    input_path = os.path.join(tmp_dir, "input.mp4")
+    await file.download_to_drive(input_path)
+
+    context.user_data["pending_input_path"] = input_path
+    context.user_data["media_kind"] = "video"
 
     keyboard = build_color_keyboard()
     await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
@@ -354,7 +382,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Отправь кружок с L-жестом двумя руками!\n\n"
+        "👋 Отправь кружок (видеосообщение) или обычное видео с L-жестом двумя руками!\n\n"
         "🤙 Указательный вверх + большой в сторону — обе руки, работает с любого расстояния.\n"
         "После этого выберешь цвет эффекта и можно добавить текст на любом языке.\n\n"
         "/cancel — отменить текущую операцию"
@@ -365,7 +393,10 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.VIDEO_NOTE, handle_video_note)],
+        entry_points=[
+            MessageHandler(filters.VIDEO_NOTE, handle_video_note),
+            MessageHandler(filters.VIDEO, handle_regular_video),
+        ],
         states={
             WAITING_COLOR: [CallbackQueryHandler(handle_color_choice, pattern="^color_")],
             WAITING_TEXT: [
@@ -385,3 +416,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
