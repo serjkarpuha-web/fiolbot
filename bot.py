@@ -87,39 +87,37 @@ def preprocess_for_detection(frame):
     return sharpened
 
 
-def detect_hands_multiscale(hands_detector, frame, w, h, full_scan=True):
+def detect_hands(hands_detector, frame, w, h):
     """
-    Ищет руки с L-жестом.
-    Если full_scan=True — проверяет несколько масштабов (для надёжного первого захвата).
-    Если full_scan=False — только основной масштаб (быстрый путь, когда руки уже отслеживаются).
-    Возвращает список (index_tip, thumb_tip) в координатах оригинального кадра.
+    Быстрая детекция рук с L-жестом на одном масштабе.
+    Если кадр большой — даунскейлим перед детекцией (MediaPipe всё равно работает
+    на низком внутреннем разрешении, гонять полный кадр — трата времени).
+    Возвращает список (index_tip, thumb_tip) в координатах ОРИГИНАЛЬНОГО кадра.
     """
-    scales = [1.0, 1.5, 0.7] if full_scan else [1.0]
+    MAX_SIDE = 480  # выше этого — даунскейлим для скорости, без потери точности жеста
+    scale = 1.0
+    search_frame = frame
+
+    longest_side = max(w, h)
+    if longest_side > MAX_SIDE:
+        scale = MAX_SIDE / longest_side
+        sw, sh = int(w * scale), int(h * scale)
+        search_frame = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
+
+    rgb = cv2.cvtColor(search_frame, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+    results = hands_detector.process(rgb)
+
     found = []
-
-    for scale in scales:
-        if scale == 1.0:
-            scaled = frame
-            sw, sh = w, h
-        else:
-            sw, sh = int(w * scale), int(h * scale)
-            scaled = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
-
-        rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = hands_detector.process(rgb)
-
-        if results.multi_hand_landmarks:
-            for hand_lm in results.multi_hand_landmarks:
-                pts = get_hand_points(hand_lm, sw, sh)
-                if pts is not None:
-                    idx_pt, thm_pt = pts
-                    idx_orig = (int(idx_pt[0] / scale), int(idx_pt[1] / scale))
-                    thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
-                    found.append((idx_orig, thm_orig))
-
-        if len(found) >= 4:
-            break
+    if results.multi_hand_landmarks:
+        sh_, sw_ = search_frame.shape[:2]
+        for hand_lm in results.multi_hand_landmarks:
+            pts = get_hand_points(hand_lm, sw_, sh_)
+            if pts is not None:
+                idx_pt, thm_pt = pts
+                idx_orig = (int(idx_pt[0] / scale), int(idx_pt[1] / scale))
+                thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
+                found.append((idx_orig, thm_orig))
 
     return found
 
@@ -285,42 +283,28 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(tmp_video, fourcc, fps, (w, h))
 
-    # Максимальная точность: model_complexity=1 (полная модель), низкий порог уверенности
-    # чтобы ловить руки на разном расстоянии, в разном освещении
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=2,
-        min_detection_confidence=0.25,
-        min_tracking_confidence=0.25,
-        model_complexity=1,
+        min_detection_confidence=0.4,
+        min_tracking_confidence=0.4,
+        model_complexity=0,  # лёгкая модель — быстрее, жест L всё равно простой для распознавания
     )
 
     prev_pts = None
     prev_center = None
-    smooth = 0.25
+    smooth = 0.35       # плавное, но отзывчивое сглаживание — одинаково для кружков и видео
     miss_count = 0
-    MAX_MISS = 5
-    MAX_JUMP = 220
-
-    frame_idx = 0
+    MAX_MISS = 6         # держим фигуру на месте при коротких потерях трекинга (~0.2-0.3 сек)
+    MAX_JUMP = 260        # защита от рывков на чужую руку/шум
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Полное многомасштабное сканирование только когда руки потеряны
-        # (первый кадр, или после MAX_MISS промахов) — иначе быстрый путь на 1 масштабе.
-        need_full_scan = (prev_pts is None) or (miss_count > 0)
-
-        if need_full_scan:
-            search_frame = preprocess_for_detection(frame)
-        else:
-            search_frame = frame
-
-        raw_points = detect_hands_multiscale(hands, search_frame, w, h, full_scan=need_full_scan)
+        raw_points = detect_hands(hands, frame, w, h)
         raw_points = dedupe_hands(raw_points)
-
         pair = pick_best_pair(raw_points, prev_center)
 
         valid_update = False
@@ -358,7 +342,6 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
                 prev_center = None
 
         out.write(frame)
-        frame_idx += 1
 
     cap.release()
     out.release()
