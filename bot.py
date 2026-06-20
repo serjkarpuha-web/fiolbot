@@ -339,8 +339,12 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
     prev_center = None
     smooth = 0.4
     miss_count = 0
-    MAX_MISS = 10
-    MAX_JUMP = max(w, h) * 0.5  # адаптивно к размеру кадра — не мешает быстрому движению рук
+    MAX_MISS = 3          # короткое удержание (0.1 сек при 30fps) — не "зависает" после ухода рук
+    MAX_JUMP = max(w, h) * 0.5
+
+    frame_idx = 0
+    total_frames_estimate = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    logger.info(f"Начинаю обработку: {w}x{h}, ~{total_frames_estimate} кадров, fps={fps:.2f}")
 
     while True:
         ret, frame = cap.read()
@@ -379,6 +383,8 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
 
         if not valid_update:
             miss_count += 1
+            # Короткое удержание фигуры только на 1-3 кадра (борьба с однокадровым морганием
+            # детектора), после чего фигура реально исчезает вместе с руками
             if prev_pts is not None and miss_count <= MAX_MISS:
                 frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
             else:
@@ -386,40 +392,50 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
                 prev_center = None
 
         out.write(frame)
+        frame_idx += 1
 
     cap.release()
     out.release()
     hands.close()
+    logger.info(f"Обработка кадров завершена: {frame_idx} кадров записано")
 
     # Проверяем что промежуточное видео реально записалось и не пустое
     if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 1000:
         logger.error("Промежуточное видео не создалось или пустое")
         return False
 
+    logger.info(f"Промежуточное видео создано: {os.path.getsize(tmp_video)} байт")
+
     cmd = ["ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
            "-c:v", "libx264", "-c:a", "aac",
            "-map", "0:v:0", "-map", "1:a:0",
            "-shortest", "-pix_fmt", "yuv420p", output_path]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=300)
+        r1 = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r1.returncode != 0:
+            logger.error(f"ffmpeg (видео+аудио) код {r1.returncode}: {r1.stderr.decode(errors='ignore')[-800:]}")
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg (видео+аудио) превысил таймаут")
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+        logger.info("Первый проход ffmpeg не дал результата, пробую без аудио")
         cmd2 = ["ffmpeg", "-y", "-i", tmp_video,
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
         try:
-            subprocess.run(cmd2, capture_output=True, timeout=300)
+            r2 = subprocess.run(cmd2, capture_output=True, timeout=300)
+            if r2.returncode != 0:
+                logger.error(f"ffmpeg (только видео) код {r2.returncode}: {r2.stderr.decode(errors='ignore')[-800:]}")
         except subprocess.TimeoutExpired:
             logger.error("ffmpeg (только видео) превысил таймаут")
 
     if os.path.exists(tmp_video):
         os.remove(tmp_video)
 
-    # Финальная проверка целостности готового файла через ffprobe —
-    # чтобы не отправить пользователю битое видео
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+        logger.error("Финальный output.mp4 не создался или пустой после обоих проходов ffmpeg")
         return False
+
+    logger.info(f"Финальное видео создано: {os.path.getsize(output_path)} байт")
 
     try:
         probe = subprocess.run(
@@ -428,12 +444,13 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
             capture_output=True, text=True, timeout=30
         )
         if probe.returncode != 0 or not probe.stdout.strip():
-            logger.error(f"ffprobe не подтвердил целостность файла: {probe.stderr}")
+            logger.error(f"ffprobe не подтвердил целостность файла: returncode={probe.returncode}, stderr={probe.stderr}")
             return False
     except Exception as e:
         logger.error(f"Ошибка проверки файла через ffprobe: {e}")
         return False
 
+    logger.info("Видео успешно обработано и проверено")
     return True
 
 
@@ -653,6 +670,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
