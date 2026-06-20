@@ -49,17 +49,62 @@ def find_font():
 FONT_PATH = find_font()
 
 
+def _finger_extended(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
+    """
+    Проверяет вытянут ли палец, сравнивая расстояния от запястья,
+    а не только Y-координаты — работает при любом повороте руки/камеры
+    (важно для круглых кружков с fisheye-искажением).
+    """
+    wrist = np.array([lm[wrist_idx].x, lm[wrist_idx].y])
+    tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
+    pip = np.array([lm[pip_idx].x, lm[pip_idx].y])
+    mcp = np.array([lm[mcp_idx].x, lm[mcp_idx].y])
+
+    dist_tip = np.linalg.norm(tip - wrist)
+    dist_pip = np.linalg.norm(pip - wrist)
+    dist_mcp = np.linalg.norm(mcp - wrist)
+
+    # Палец вытянут, если кончик заметно дальше от запястья, чем сустав
+    return dist_tip > dist_pip * 1.05 and dist_tip > dist_mcp * 1.15
+
+
+def _finger_curled(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
+    """Проверяет согнут ли палец (кончик не дальше от запястья, чем средний сустав)"""
+    wrist = np.array([lm[wrist_idx].x, lm[wrist_idx].y])
+    tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
+    pip = np.array([lm[pip_idx].x, lm[pip_idx].y])
+
+    dist_tip = np.linalg.norm(tip - wrist)
+    dist_pip = np.linalg.norm(pip - wrist)
+
+    return dist_tip < dist_pip * 1.15
+
+
 def get_hand_points(hand_landmarks, w, h):
     lm = hand_landmarks.landmark
-    # Чуть более мягкая проверка L-жеста (с небольшим запасом),
-    # чтобы естественное дрожание руки/неидеальный жест не "выбивали" детекцию каждый второй кадр
-    margin = 0.01
-    index_up = (lm[8].y < lm[6].y + margin) and (lm[6].y < lm[5].y + margin)
-    middle_down = lm[12].y > lm[10].y - margin
-    ring_down   = lm[16].y > lm[14].y - margin
-    pinky_down  = lm[20].y > lm[18].y - margin
-    if not (index_up and middle_down and ring_down and pinky_down):
+
+    # Указательный должен быть вытянут — это главный признак жеста
+    index_extended = _finger_extended(lm, 8, 6, 5)
+    if not index_extended:
         return None
+
+    # Остальные пальцы — мягкая проверка, достаточно что они НЕ так же вытянуты как указательный
+    # (полный кулак не нужен, важно отличить L-жест от просто открытой ладони)
+    wrist = np.array([lm[0].x, lm[0].y])
+    index_tip = np.array([lm[8].x, lm[8].y])
+    dist_index = np.linalg.norm(index_tip - wrist)
+
+    other_tips = [12, 16, 20]
+    shorter_count = 0
+    for tip_idx in other_tips:
+        tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
+        dist_tip = np.linalg.norm(tip - wrist)
+        if dist_tip < dist_index * 0.95:
+            shorter_count += 1
+
+    if shorter_count < 1:  # хотя бы один палец заметно короче указательного
+        return None
+
     ix = int(lm[INDEX_TIP].x * w)
     iy = int(lm[INDEX_TIP].y * h)
     tx = int(lm[THUMB_TIP].x * w)
@@ -93,7 +138,7 @@ def detect_hands(hands_detector, frame, w, h):
     на низком внутреннем разрешении, гонять полный кадр — трата времени).
     Возвращает список (index_tip, thumb_tip) в координатах ОРИГИНАЛЬНОГО кадра.
     """
-    MAX_SIDE = 480  # выше этого — даунскейлим для скорости, без потери точности жеста
+    MAX_SIDE = 640  # выше этого — даунскейлим для скорости; 640 достаточно и для кружков, и для видео
     scale = 1.0
     search_frame = frame
 
@@ -155,7 +200,7 @@ def pick_best_pair(hand_points, prev_center=None):
         try:
             quad = make_quad(a, b)
             area = cv2.contourArea(quad)
-            if area < 400:  # слишком маленький/вырожденный — пропускаем
+            if area < 150:  # слишком маленький/вырожденный — пропускаем
                 continue
             center = quad.mean(axis=0)
             candidates.append((area, center, a, b))
@@ -287,15 +332,15 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
         max_num_hands=2,
         min_detection_confidence=0.3,
         min_tracking_confidence=0.3,
-        model_complexity=1,  # точная модель — важнее для стабильного распознавания L-жеста, чем скорость
+        model_complexity=0,  # лёгкая модель — критично для скорости на слабом CPU; жест компенсирован мягкой проверкой
     )
 
     prev_pts = None
     prev_center = None
-    smooth = 0.35
+    smooth = 0.4
     miss_count = 0
-    MAX_MISS = 10         # держим фигуру на месте дольше при коротких потерях трекинга (~0.3-0.4 сек)
-    MAX_JUMP = 260
+    MAX_MISS = 10
+    MAX_JUMP = max(w, h) * 0.5  # адаптивно к размеру кадра — не мешает быстрому движению рук
 
     while True:
         ret, frame = cap.read()
@@ -313,7 +358,7 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
                 area = cv2.contourArea(quad)
                 new_center = quad.mean(axis=0)
 
-                if area >= 400:
+                if area >= 150:
                     if prev_center is None:
                         valid_update = True
                     else:
@@ -608,6 +653,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
