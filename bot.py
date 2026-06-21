@@ -83,26 +83,32 @@ def _finger_curled(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
 def get_hand_points(hand_landmarks, w, h):
     lm = hand_landmarks.landmark
 
-    # Указательный должен быть вытянут — это главный признак жеста
+    # Указательный должен быть явно вытянут — это главный признак жеста
     index_extended = _finger_extended(lm, 8, 6, 5)
     if not index_extended:
         return None
 
-    # Остальные пальцы — мягкая проверка, достаточно что они НЕ так же вытянуты как указательный
-    # (полный кулак не нужен, важно отличить L-жест от просто открытой ладони)
+    # Средний/безымянный/мизинец должны быть заметно короче указательного (согнуты).
+    # Требуем минимум 2 из 3 — иначе открытая ладонь тоже проходила бы проверку.
     wrist = np.array([lm[0].x, lm[0].y])
     index_tip = np.array([lm[8].x, lm[8].y])
     dist_index = np.linalg.norm(index_tip - wrist)
 
     other_tips = [12, 16, 20]
-    shorter_count = 0
+    curled_count = 0
     for tip_idx in other_tips:
         tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
         dist_tip = np.linalg.norm(tip - wrist)
-        if dist_tip < dist_index * 0.95:
-            shorter_count += 1
+        if dist_tip < dist_index * 0.75:  # заметно короче, не просто чуть-чуть
+            curled_count += 1
 
-    if shorter_count < 1:  # хотя бы один палец заметно короче указательного
+    if curled_count < 2:
+        return None
+
+    # Большой палец должен быть отведён в сторону от указательного (не прижат к ладони)
+    thumb_tip = np.array([lm[THUMB_TIP].x, lm[THUMB_TIP].y])
+    thumb_index_dist = np.linalg.norm(thumb_tip - index_tip)
+    if thumb_index_dist < dist_index * 0.3:  # слишком близко к указательному — не похоже на L
         return None
 
     ix = int(lm[INDEX_TIP].x * w)
@@ -150,7 +156,12 @@ def detect_hands(hands_detector, frame, w, h):
 
     rgb = cv2.cvtColor(search_frame, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
-    results = hands_detector.process(rgb)
+
+    try:
+        results = hands_detector.process(rgb)
+    except Exception as e:
+        logger.warning(f"MediaPipe упал на кадре, пропускаю: {e}")
+        return []
 
     found = []
     if results.multi_hand_landmarks:
@@ -369,45 +380,50 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
         if not ret:
             break
 
-        raw_points = detect_hands(hands, frame, w, h)
-        raw_points = dedupe_hands(raw_points)
-        pair = pick_best_pair(raw_points, prev_center)
+        try:
+            raw_points = detect_hands(hands, frame, w, h)
+            raw_points = dedupe_hands(raw_points)
+            pair = pick_best_pair(raw_points, prev_center)
 
-        valid_update = False
-        if pair is not None:
-            try:
-                quad = make_quad(pair[0], pair[1])
-                area = cv2.contourArea(quad)
-                new_center = quad.mean(axis=0)
+            valid_update = False
+            if pair is not None:
+                try:
+                    quad = make_quad(pair[0], pair[1])
+                    area = cv2.contourArea(quad)
+                    new_center = quad.mean(axis=0)
 
-                if area >= 150:
-                    if prev_center is None:
-                        valid_update = True
-                    else:
-                        jump = np.linalg.norm(new_center - prev_center)
-                        # При резком движении (большой скачок) доверяем новой позиции сразу,
-                        # а не ждём — иначе фигура "не успевает" за быстрыми руками
-                        valid_update = True
+                    if area >= 150:
+                        if prev_center is None:
+                            valid_update = True
+                        else:
+                            jump = np.linalg.norm(new_center - prev_center)
+                            # При резком движении (большой скачок) доверяем новой позиции сразу,
+                            # а не ждём — иначе фигура "не успевает" за быстрыми руками
+                            valid_update = True
 
-                if valid_update:
-                    if prev_pts is None:
-                        prev_pts = quad.astype(np.float32)
-                    else:
-                        prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
-                    prev_center = prev_pts.mean(axis=0)
+                    if valid_update:
+                        if prev_pts is None:
+                            prev_pts = quad.astype(np.float32)
+                        else:
+                            prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
+                        prev_center = prev_pts.mean(axis=0)
+                        frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
+                        miss_count = 0
+                except Exception as e:
+                    logger.warning(f"Кадр {frame_idx}: ошибка построения фигуры: {e}")
+                    valid_update = False
+
+            if not valid_update:
+                miss_count += 1
+                if prev_pts is not None and miss_count <= MAX_MISS:
                     frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
-                    miss_count = 0
-            except Exception as e:
-                logger.warning(f"Кадр {frame_idx}: ошибка построения фигуры: {e}")
-                valid_update = False
-
-        if not valid_update:
-            miss_count += 1
-            if prev_pts is not None and miss_count <= MAX_MISS:
-                frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
-            else:
-                prev_pts = None
-                prev_center = None
+                else:
+                    prev_pts = None
+                    prev_center = None
+        except Exception as e:
+            # Любая неожиданная ошибка на кадре — просто пишем кадр как есть, без эффекта,
+            # и идём дальше. Никогда не обрываем обработку всего видео из-за одного кадра.
+            logger.warning(f"Кадр {frame_idx}: непредвиденная ошибка, пишу без эффекта: {e}")
 
         out.write(frame)
         frame_idx += 1
@@ -418,7 +434,18 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     cap.release()
     out.release()
     hands.close()
-    logger.info(f"Обработка кадров завершена: {frame_idx} кадров записано")
+    logger.info(f"Обработка кадров завершена: {frame_idx} кадров записано из ~{total_frames_estimate} ожидаемых")
+
+    if total_frames_estimate > 0 and frame_idx < total_frames_estimate * 0.5:
+        logger.error(
+            f"Обработано подозрительно мало кадров ({frame_idx} из {total_frames_estimate}) — "
+            f"вероятен сбой декодирования исходного видео или MediaPipe"
+        )
+
+    # Небольшая пауза, чтобы файловый дескриптор гарантированно сбросился на диск
+    # перед тем как ffmpeg попытается его прочитать (актуально на медленных/нагруженных системах)
+    import time
+    time.sleep(0.3)
 
     # Проверяем что промежуточное видео реально записалось и не пустое
     if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 1000:
@@ -705,6 +732,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
