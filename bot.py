@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
+# name=bot.py
 import os
 import logging
 import asyncio
 import subprocess
 import tempfile
+import threading
+from collections import deque
+
 import cv2
 import numpy as np
 import mediapipe as mp
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
-    filters, ContextTypes
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
 )
-from collections import deque
-import threading
 
+# ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise SystemExit("Error: BOT_TOKEN env var is not set")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,11 +37,11 @@ THUMB_TIP = 4
 
 COLORS = {
     "purple": {"name": "🟣 Пурпурный", "bgr": (255, 0, 200)},
-    "blue":   {"name": "🔵 Синий",     "bgr": (255, 100, 0)},
-    "green":  {"name": "🟢 Зелёный",   "bgr": (60, 255, 60)},
-    "red":    {"name": "🔴 Красный",   "bgr": (40, 30, 230)},
-    "yellow": {"name": "🟡 Жёлтый",    "bgr": (40, 230, 230)},
-    "white":  {"name": "⚪ Белый",     "bgr": (240, 240, 240)},
+    "blue": {"name": "🔵 Синий", "bgr": (255, 100, 0)},
+    "green": {"name": "🟢 Зелёный", "bgr": (60, 255, 60)},
+    "red": {"name": "🔴 Красный", "bgr": (40, 30, 230)},
+    "yellow": {"name": "🟡 Жёлтый", "bgr": (40, 230, 230)},
+    "white": {"name": "⚪ Белый", "bgr": (240, 240, 240)},
 }
 
 FONT_PATHS = [
@@ -49,6 +58,8 @@ def find_font():
 
 
 FONT_PATH = find_font()
+
+# ---------- HELPER: hand geometry ----------
 
 
 def _finger_extended(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
@@ -109,113 +120,7 @@ def get_hand_points(hand_landmarks, w, h):
     return (ix, iy), (tx, ty)
 
 
-def preprocess_for_detection(frame):
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge((l, a, b))
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    blurred = cv2.GaussianBlur(enhanced, (0, 0), 3)
-    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
-    return sharpened
-
-
-def detect_hands(hands_detector, frame, w, h):
-    MAX_SIDE = 640
-    scale = 1.0
-    search_frame = frame
-
-    longest_side = max(w, h)
-    if longest_side > MAX_SIDE:
-        scale = MAX_SIDE / longest_side
-        sw, sh = int(w * scale), int(h * scale)
-        search_frame = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
-
-    rgb = cv2.cvtColor(search_frame, cv2.COLOR_BGR2RGB)
-    rgb.flags.writeable = False
-
-    try:
-        results = hands_detector.process(rgb)
-    except Exception as e:
-        logger.warning(f"MediaPipe упал на кадре, пропускаю: {e}")
-        return []
-
-    found = []
-    if results.multi_hand_landmarks:
-        sh_, sw_ = search_frame.shape[:2]
-        for hand_lm in results.multi_hand_landmarks:
-            pts = get_hand_points(hand_lm, sw_, sh_)
-            if pts is not None:
-                idx_pt, thm_pt = pts
-                idx_orig = (int(idx_pt[0] / scale), int(idx_pt[1] / scale))
-                thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
-                found.append((idx_orig, thm_orig))
-
-    return found
-
-
-def dedupe_hands(hand_points, dist_threshold=60):
-    unique = []
-    for idx_pt, thm_pt in hand_points:
-        is_dup = False
-        for u_idx, u_thm in unique:
-            if (abs(idx_pt[0] - u_idx[0]) < dist_threshold and
-                    abs(idx_pt[1] - u_idx[1]) < dist_threshold):
-                is_dup = True
-                break
-        if not is_dup:
-            unique.append((idx_pt, thm_pt))
-    return unique
-
-
-def pick_best_pair(hand_points, prev_center=None):
-    if len(hand_points) < 2:
-        return None
-    if len(hand_points) == 2:
-        return hand_points[0], hand_points[1]
-
-    from itertools import combinations
-    candidates = []
-    for a, b in combinations(hand_points, 2):
-        try:
-            quad = make_quad(a, b)
-            area = cv2.contourArea(quad)
-            if area < 150:
-                continue
-            center = quad.mean(axis=0)
-            candidates.append((area, center, a, b))
-        except Exception:
-            continue
-
-    if not candidates:
-        return None
-
-    if prev_center is not None:
-        candidates.sort(key=lambda c: np.linalg.norm(c[1] - prev_center))
-    else:
-        candidates.sort(key=lambda c: -c[0])
-
-    _, _, a, b = candidates[0]
-    return a, b
-
-
-def make_quad(hand_a, hand_b):
-    a_idx, a_thm = hand_a
-    b_idx, b_thm = hand_b
-
-    a_cx = (a_idx[0] + a_thm[0]) // 2
-    b_cx = (b_idx[0] + b_thm[0]) // 2
-
-    if a_cx > b_cx:
-        a_idx, a_thm, b_idx, b_thm = b_idx, b_thm, a_idx, a_thm
-
-    tl = np.array(a_idx)
-    tr = np.array(b_idx)
-    br = np.array(b_thm)
-    bl = np.array(a_thm)
-    return np.array([tl, tr, br, bl], dtype=np.int32)
+# ---------- IMAGE TEXT + EFFECTS ----------
 
 
 def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
@@ -241,15 +146,17 @@ def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
     glow_bgr = glow_blur[:, :, :3]
     glow_alpha = (glow_blur[:, :, 3:4].astype(np.float32) / 255.0) * 0.5
 
-    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - glow_alpha) +
-                  glow_bgr.astype(np.float32) * glow_alpha).astype(np.uint8)
+    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - glow_alpha) + glow_bgr.astype(np.float32) * glow_alpha).astype(
+        np.uint8
+    )
 
     sharp_np = cv2.cvtColor(np.array(glow_img), cv2.COLOR_RGBA2BGRA)
     sharp_bgr = sharp_np[:, :, :3]
     sharp_alpha = sharp_np[:, :, 3:4].astype(np.float32) / 255.0
 
-    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - sharp_alpha) +
-                  sharp_bgr.astype(np.float32) * sharp_alpha).astype(np.uint8)
+    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - sharp_alpha) + sharp_bgr.astype(np.float32) * sharp_alpha).astype(
+        np.uint8
+    )
 
     return img_bgr
 
@@ -308,12 +215,115 @@ def apply_quad_effect(frame, pts, text=None, color_bgr=(255, 0, 200)):
     return frame
 
 
+# ---------- Detection helpers ----------
+
+
+def detect_hands(hands_detector, frame, w, h):
+    MAX_SIDE = 640
+    scale = 1.0
+    search_frame = frame
+
+    longest_side = max(w, h)
+    if longest_side > MAX_SIDE:
+        scale = MAX_SIDE / longest_side
+        sw, sh = int(w * scale), int(h * scale)
+        search_frame = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
+
+    rgb = cv2.cvtColor(search_frame, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+
+    try:
+        results = hands_detector.process(rgb)
+    except Exception as e:
+        logger.warning(f"MediaPipe failed on frame, skipping: {e}")
+        return []
+
+    found = []
+    if results.multi_hand_landmarks:
+        sh_, sw_ = search_frame.shape[:2]
+        for hand_lm in results.multi_hand_landmarks:
+            pts = get_hand_points(hand_lm, sw_, sh_)
+            if pts is not None:
+                idx_pt, thm_pt = pts
+                idx_orig = (int(idx_pt[0] / scale), int(idx_pt[1] / scale))
+                thm_orig = (int(thm_pt[0] / scale), int(thm_pt[1] / scale))
+                found.append((idx_orig, thm_orig))
+
+    return found
+
+
+def dedupe_hands(hand_points, dist_threshold=60):
+    unique = []
+    for idx_pt, thm_pt in hand_points:
+        is_dup = False
+        for u_idx, u_thm in unique:
+            if (abs(idx_pt[0] - u_idx[0]) < dist_threshold and abs(idx_pt[1] - u_idx[1]) < dist_threshold):
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append((idx_pt, thm_pt))
+    return unique
+
+
+def make_quad(hand_a, hand_b):
+    a_idx, a_thm = hand_a
+    b_idx, b_thm = hand_b
+
+    a_cx = (a_idx[0] + a_thm[0]) // 2
+    b_cx = (b_idx[0] + b_thm[0]) // 2
+
+    if a_cx > b_cx:
+        a_idx, a_thm, b_idx, b_thm = b_idx, b_thm, a_idx, a_thm
+
+    tl = np.array(a_idx)
+    tr = np.array(b_idx)
+    br = np.array(b_thm)
+    bl = np.array(a_thm)
+    return np.array([tl, tr, br, bl], dtype=np.int32)
+
+
+def pick_best_pair(hand_points, prev_center=None):
+    if len(hand_points) < 2:
+        return None
+    if len(hand_points) == 2:
+        return hand_points[0], hand_points[1]
+
+    from itertools import combinations
+
+    candidates = []
+    for a, b in combinations(hand_points, 2):
+        try:
+            quad = make_quad(a, b)
+            area = cv2.contourArea(quad)
+            if area < 150:
+                continue
+            center = quad.mean(axis=0)
+            candidates.append((area, center, a, b))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    if prev_center is not None:
+        candidates.sort(key=lambda c: np.linalg.norm(c[1] - prev_center))
+    else:
+        candidates.sort(key=lambda c: -c[0])
+
+    _, _, a, b = candidates[0]
+    return a, b
+
+
+# ---------- ffmpeg helpers ----------
+
+
 def ffprobe_duration(path):
     try:
         p = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=10
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if p.returncode == 0 and p.stdout.strip():
             return float(p.stdout.strip())
@@ -323,6 +333,10 @@ def ffprobe_duration(path):
 
 
 def prepare_work_input(input_path, max_seconds=20):
+    """
+    Convert / trim input to MP4 H.264 up to max_seconds when needed.
+    Returns (work_input_path, created_temp_bool)
+    """
     duration = ffprobe_duration(input_path)
     need_trim = False
     if duration is not None and duration > max_seconds + 0.01:
@@ -336,21 +350,40 @@ def prepare_work_input(input_path, max_seconds=20):
 
     out_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     out_tmp.close()
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-ss", "0", "-t", str(max_seconds),
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "+faststart", out_tmp.name]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-ss",
+        "0",
+        "-t",
+        str(max_seconds),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        out_tmp.name,
+    ]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out_tmp.name) and os.path.getsize(out_tmp.name) > 1000:
             return out_tmp.name, True
         else:
-            logger.warning(f"ffmpeg convert failed, fallback to input. stderr: {r.stderr.decode(errors='ignore')[-400:]}")
+            logger.warning("ffmpeg convert failed, fallback to input. stderr: %s", r.stderr.decode(errors="ignore")[-400:])
             try:
                 os.unlink(out_tmp.name)
             except Exception:
                 pass
             return input_path, False
     except Exception as e:
-        logger.warning(f"ffmpeg convert exception: {e}")
+        logger.warning("ffmpeg convert exception: %s", e)
         try:
             os.unlink(out_tmp.name)
         except Exception:
@@ -358,13 +391,15 @@ def prepare_work_input(input_path, max_seconds=20):
         return input_path, False
 
 
+# ---------- CORE VIDEO PROCESSING ----------
+
+
 def _process_video_inner(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
-    # Подготовка входа: конвертируем/обрезаем до 20s, если нужно
     work_input, created_tmp = prepare_work_input(input_path, max_seconds=20)
 
     cap = cv2.VideoCapture(work_input)
     if not cap.isOpened():
-        logger.error("cv2 не открыл видео")
+        logger.error("cv2 cannot open video %s", work_input)
         if created_tmp and os.path.exists(work_input):
             os.remove(work_input)
         return False
@@ -377,7 +412,7 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(tmp_video, fourcc, fps, (w, h))
     if not out.isOpened():
-        logger.error("cv2 VideoWriter не открылся")
+        logger.error("cv2 VideoWriter failed")
         cap.release()
         if created_tmp and os.path.exists(work_input):
             os.remove(work_input)
@@ -408,12 +443,12 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     MAX_MISS = 6
 
     frame_idx = 0
-    total_frames_estimate = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    logger.info(f"Начинаю обработку: {w}x{h}, ~{total_frames_estimate} кадров, fps={fps:.2f}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    logger.info("Start processing: %dx%d, ~%d frames, fps=%.2f", w, h, total_frames, fps)
 
     while True:
         if cancel_event is not None and cancel_event.is_set():
-            logger.info("Обработка отменена пользователем")
+            logger.info("Processing canceled by user")
             cap.release()
             out.release()
             hands.close()
@@ -465,7 +500,7 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
 
                         if jump > MAX_JUMP or not (area_ratio_min <= area_ratio <= area_ratio_max):
                             outlier_count += 1
-                            logger.debug(f"Выброс детекции: jump={jump:.1f}, area_ratio={area_ratio:.2f}, outlier_count={outlier_count}")
+                            logger.debug("Detection outlier: jump=%.1f area_ratio=%.2f outlier_count=%d", jump, area_ratio, outlier_count)
                             if outlier_count >= 3:
                                 alpha = 1.0 - smooth_min
                                 prev_pts = prev_pts * (1 - alpha) + quad.astype(np.float32) * alpha
@@ -492,7 +527,7 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                             miss_count = 0
                             valid_update = True
                 except Exception as e:
-                    logger.debug(f"Кадр {frame_idx}: ошибка построения фигуры: {e}")
+                    logger.debug("Frame %d: quad build error: %s", frame_idx, e)
                     valid_update = False
 
             if not valid_update:
@@ -506,18 +541,18 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                     pts_history.clear()
                     area_history.clear()
         except Exception as e:
-            logger.warning(f"Кадр {frame_idx}: непредвиденная ошибка, пишу без эффекта: {e}")
+            logger.warning("Frame %d: unexpected error, writing frame without effect: %s", frame_idx, e)
 
         out.write(frame)
         frame_idx += 1
 
         if frame_idx % 60 == 0:
-            logger.info(f"Прогресс: {frame_idx}/{total_frames_estimate} кадров")
+            logger.info("Progress: %d/%d frames", frame_idx, total_frames)
 
     cap.release()
     out.release()
     hands.close()
-    logger.info(f"Обработка кадров завершена: {frame_idx} кадров записано из ~{total_frames_estimate} ожидаемых")
+    logger.info("Frame processing finished: %d frames", frame_idx)
 
     if created_tmp and os.path.exists(work_input):
         try:
@@ -525,129 +560,145 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
         except Exception:
             pass
 
+    # small pause to ensure file flush
     import time
     time.sleep(0.3)
 
     if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 1000:
-        logger.error("Промежуточное видео не создалось или пустое")
+        logger.error("Intermediate video not created or empty")
         return False
 
-    cmd = ["ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
-           "-c:v", "libx264", "-c:a", "aac",
-           "-map", "0:v:0", "-map", "1:a:0",
-           "-shortest", "-pix_fmt", "yuv420p", output_path]
+    logger.info("Intermediate video created: %d bytes", os.path.getsize(tmp_video))
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        tmp_video,
+        "-i",
+        input_path,
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-shortest",
+        "-pix_fmt",
+        "yuv420p",
+        output_path,
+    ]
     try:
         r1 = subprocess.run(cmd, capture_output=True, timeout=300)
         if r1.returncode != 0:
-            logger.error(f"ffmpeg (видео+аудио) код {r1.returncode}: {r1.stderr.decode(errors='ignore')[-800:]}")
+            logger.error("ffmpeg (video+audio) rc=%d stderr=%s", r1.returncode, r1.stderr.decode(errors="ignore")[-800:])
     except subprocess.TimeoutExpired:
-        logger.error("ffmpeg (видео+аудио) превысил таймаут")
+        logger.error("ffmpeg (video+audio) timeout")
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-        logger.info("Первый проход ffmpeg не дал результата, пробую без аудио")
-        cmd2 = ["ffmpeg", "-y", "-i", tmp_video,
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
+        logger.info("First ffmpeg pass failed, trying video-only")
+        cmd2 = ["ffmpeg", "-y", "-i", tmp_video, "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
         try:
             r2 = subprocess.run(cmd2, capture_output=True, timeout=300)
             if r2.returncode != 0:
-                logger.error(f"ffmpeg (только видео) код {r2.returncode}: {r2.stderr.decode(errors='ignore')[-800:]}")
+                logger.error("ffmpeg (video only) rc=%d stderr=%s", r2.returncode, r2.stderr.decode(errors="ignore")[-800:])
         except subprocess.TimeoutExpired:
-            logger.error("ffmpeg (только видео) превысил таймаут")
+            logger.error("ffmpeg (video only) timeout")
 
-    if os.path.exists(tmp_video):
-        try:
+    try:
+        if os.path.exists(tmp_video):
             os.remove(tmp_video)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-        logger.error("Финальный output.mp4 не создался или пустой после обоих проходов ffmpeg")
+        logger.error("Final output not created or empty after ffmpeg attempts")
         return False
 
     try:
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=duration", "-of", "csv=p=0", output_path],
-            capture_output=True, text=True, timeout=30
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "csv=p=0", output_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if probe.returncode != 0 or not probe.stdout.strip():
-            logger.error(f"ffprobe не подтвердил целостность файла: returncode={probe.returncode}, stderr={probe.stderr}")
+            logger.error("ffprobe failed to confirm file integrity: rc=%s stderr=%s", probe.returncode, probe.stderr)
             return False
     except Exception as e:
-        logger.error(f"Ошибка проверки файла через ffprobe: {e}")
+        logger.error("ffprobe check exception: %s", e)
         return False
 
-    logger.info("Видео успешно обработано и проверено")
+    logger.info("Video processed and verified successfully")
     return True
 
 
 def process_video(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
     import traceback
+
     try:
         return _process_video_inner(input_path, output_path, custom_text, color_bgr, cancel_event=cancel_event)
     except Exception as e:
-        logger.error(f"КРИТИЧЕСКАЯ ошибка в process_video: {e}\n{traceback.format_exc()}")
+        logger.error("CRITICAL process_video error: %s\n%s", e, traceback.format_exc())
         return False
+
+
+# ---------- async wrapper that runs processing in thread pool ----------
 
 
 async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input_path: str, custom_text=None, color_bgr=(255, 0, 200)):
     msg = update.effective_message
     status_msg = await msg.reply_text("🔄 Обрабатываю видео, это может занять некоторое время...")
     output_path = input_path + "_out.mp4"
-    # создаём событие отмены и сохраняем в user_data, чтобы cancel handler мог его выставить
     cancel_event = threading.Event()
     context.user_data["cancel_event"] = cancel_event
 
     try:
-        loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(
-            None, process_video, input_path, output_path, custom_text, color_bgr, cancel_event
-        )
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(None, process_video, input_path, output_path, custom_text, color_bgr, cancel_event)
 
-        # очистим cancel_event
         context.user_data.pop("cancel_event", None)
 
         if not success:
-            await status_msg.edit_text(
-                "❌ Не удалось обработать видео или обработка была отменена."
-            )
+            await status_msg.edit_text("❌ Не удалось обработать видео или обработка была отменена.")
             return
 
         await status_msg.edit_text("✅ Готово, отправляю результат...")
         await msg.reply_video(video=InputFile(output_path))
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
     finally:
         try:
             if os.path.exists(output_path):
                 os.remove(output_path)
         except Exception:
             pass
-        # не удаляем входной файл — вызывающая логика должна это делать
 
 
-# ========== Telegram handlers: start/help/cancel/buttons + media handler ==========
+# ---------- Telegram handlers, keyboard, commands ----------
+
 
 def main_keyboard():
     kb = [
-        [InlineKeyboardButton("▶️ Start", callback_data="btn_start"),
-         InlineKeyboardButton("❓ Help", callback_data="btn_help")],
-        [InlineKeyboardButton("⛔ Cancel", callback_data="btn_cancel")]
+        [InlineKeyboardButton("▶️ Start", callback_data="btn_start"), InlineKeyboardButton("❓ Help", callback_data="btn_help")],
+        [InlineKeyboardButton("⛔ Cancel", callback_data="btn_cancel")],
     ]
     return InlineKeyboardMarkup(kb)
 
 
 START_TEXT = (
     "Привет! Я бот, который рисует эффект вокруг пары рук в форме «L» в твоём видео.\n\n"
-    "Нажми «Start» и отправь видео (файл, видеосообщение или документ с видео) — "
-    "я обработаю его и верну результат с эффектом.\n\n"
-    "Максимальная длина: 20 секунд. Поддерживаются большинство форматов — бот автоматически "
-    "конвертирует/обрезает при необходимости."
+    "Нажми «Start» и отправь видео (файл, видеосообщение или документ с видео) — я обработаю его и верну результат с эффектом.\n\n"
+    "Максимальная длина: 20 секунд. Поддерживаются большинство форматов — бот автоматически конвертирует/обрежет при необходимости."
 )
-
 
 HELP_TEXT = (
     "Как пользоваться ботом — кратко:\n\n"
-    "1) Нажми «Start» или просто отправь видео (файл, видеосообщение или документ с видео).\n"
+    "1) Нажми «Start» или отправь видео (файл, видеосообщение или документ с видео).\n"
     "2) Видео до 20 секунд. Если длиннее — бот обрежет первые 20 секунд.\n"
     "3) В кадре покажи жест «L»: указательный палец прямо, остальные пальцы согнуты, большой палец отведён в сторону.\n"
     "   - Рука 1 (L) справа, рука 2 (L) слева — бот рисует эффект между ними.\n"
@@ -656,17 +707,19 @@ HELP_TEXT = (
     "Что подходит: .mp4, .mov, .mkv и другие — бот попытается перекодировать. Требования: на сервере должны быть ffmpeg и ffprobe.\n\n"
     "Советы по стабильности рамки:\n"
     "- Держите руки в кадре несколько кадров, не прячьте их на доли секунды.\n"
-    "- Если рамка дрожит, попробуйте поменьше резких движений или помедленнее двигаться.\n\n"
-    "Если нужно — могу добавить выбор цвета рамки, тонкую настройку чувствительности или трассировку оптическим потоком — напиши."
+    "- Если рамка дрожит, попробуйте поменьше резких движений или помедленнее двигаться.\n"
 )
+
+# Handlers
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("CMD /start from user_id=%s", update.effective_user.id)
     await update.effective_message.reply_text(START_TEXT, reply_markup=main_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # support both callback_query and plain command
+    logger.info("CMD /help from user_id=%s", update.effective_user.id)
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.message.reply_text(HELP_TEXT)
@@ -675,7 +728,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # support both callback_query and command
+    logger.info("CMD /cancel from user_id=%s", update.effective_user.id)
     if update.callback_query:
         await update.callback_query.answer()
         user_msg = update.callback_query.message
@@ -693,23 +746,30 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    logger.info("CallbackQuery data=%s from user_id=%s", data, update.effective_user.id)
+    await query.answer()
     if data == "btn_help":
-        await help_command(update, context)
+        await query.message.reply_text(HELP_TEXT)
     elif data == "btn_start":
-        await query.answer()
-        await query.message.reply_text("Отправь мне видео (файл, видеосообщение или документ с видео). Максимум 20 секунд.", reply_markup=None)
+        await query.message.reply_text("Отправь мне видео (файл, видеосообщение или документ с видео). Максимум 20 секунд.")
     elif data == "btn_cancel":
-        await cancel_command(update, context)
+        ev = context.user_data.get("cancel_event")
+        if ev and isinstance(ev, threading.Event):
+            ev.set()
+            await query.message.reply_text("Отмена запрошена.")
+        else:
+            await query.message.reply_text("Нет активной задачи для отмены.")
     else:
-        await query.answer()
+        await query.message.reply_text("Неизвестная кнопка.")
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    logger.info("handle_media: video=%s video_note=%s document=%s from user=%s", bool(msg.video), bool(msg.video_note), bool(msg.document), update.effective_user.id)
+
     file_obj = None
     media_kind = None
 
-    # accept video, video_note, or document with video mime
     if msg.video:
         file_obj = await msg.video.get_file()
         media_kind = "video"
@@ -726,10 +786,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tmpf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmpf.close()
     try:
-        # скачиваем файл
+        logger.info("Downloading file to %s", tmpf.name)
         await file_obj.download_to_drive(tmpf.name)
     except Exception as e:
-        logger.exception("Ошибка скачивания файла")
+        logger.exception("Error downloading file")
         await msg.reply_text("Не удалось скачать файл. Попробуй ещё раз.")
         try:
             os.remove(tmpf.name)
@@ -738,9 +798,11 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["media_kind"] = media_kind
+
+    # Run processing
     await run_and_send(update, context, tmpf.name, custom_text=None, color_bgr=(255, 0, 200))
 
-    # удаляем исходник по завершении (если он ещё есть)
+    # Ensure local file removed
     try:
         if os.path.exists(tmpf.name):
             os.remove(tmpf.name)
@@ -748,7 +810,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# ========== App entrypoint ==========
+async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Text from %s: %s", update.effective_user.id, update.effective_message.text)
+    await update.effective_message.reply_text("Я ожидаю видео: отправь файл/видео/видеосообщение или нажми /help")
+
+
+# ---------- APP BUILD & RUN ----------
+
 
 def build_app(token: str):
     app = ApplicationBuilder().token(token).build()
@@ -759,19 +827,21 @@ def build_app(token: str):
 
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    media_filter = filters.VIDEO | filters.VIDEO_NOTE | (filters.Document.EXTENSION | filters.Document.MIME_TYPE)
-    # simpler: accept video, video_note and document with video mime in handler itself
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_media))
+    # Explicit media handlers
+    app.add_handler(MessageHandler(filters.VIDEO, handle_media))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_media))
+    # documents with videos handled in handler check
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_media))
+
+    # fallback for text
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_fallback))
 
     return app
 
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        print("Error: BOT_TOKEN env var is not set")
-        raise SystemExit(1)
     application = build_app(BOT_TOKEN)
-    logger.info("Бот запущен")
+    logger.info("Bot started")
     application.run_polling()
 
 
