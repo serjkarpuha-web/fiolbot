@@ -392,6 +392,7 @@ def prepare_work_input(input_path, max_seconds=20):
 
 
 # ---------- CORE VIDEO PROCESSING ----------
+# NOTE: this is the robust version that handles short videos and multiple OpenCV fourcc fallbacks.
 
 
 def _process_video_inner(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
@@ -404,18 +405,58 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
             os.remove(work_input)
         return False
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Get fps/size safely
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if fps <= 1.0:
+        # fallback: try to compute fps from frame_count/duration or default to 25
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            dur = ffprobe_duration(work_input)
+            if dur and frame_count and dur > 0:
+                fps = max(1.0, frame_count / dur)
+            else:
+                fps = 25.0
+        except Exception:
+            fps = 25.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
 
-    tmp_video = input_path + "_tmp.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(tmp_video, fourcc, fps, (w, h))
-    if not out.isOpened():
-        logger.error("cv2 VideoWriter failed")
+    # unique temporary file for intermediate video
+    tmpf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp_video = tmpf.name
+    tmpf.close()
+
+    # Try multiple fourcc candidates if one doesn't open
+    fourcc_candidates = ["mp4v", "X264", "avc1", "H264"]
+    out = None
+    for fc in fourcc_candidates:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*fc)
+            out = cv2.VideoWriter(tmp_video, fourcc, float(fps), (w, h))
+            if out.isOpened():
+                logger.info("Opened VideoWriter with fourcc=%s fps=%.2f size=%dx%d -> %s", fc, fps, w, h, tmp_video)
+                break
+            else:
+                logger.warning("VideoWriter with fourcc=%s failed to open", fc)
+                try:
+                    out.release()
+                except Exception:
+                    pass
+                out = None
+        except Exception as e:
+            logger.warning("VideoWriter attempt fourcc=%s raised: %s", fc, e)
+            out = None
+
+    if out is None or not out.isOpened():
+        logger.error("Failed to open VideoWriter with any fourcc: %s", fourcc_candidates)
         cap.release()
         if created_tmp and os.path.exists(work_input):
             os.remove(work_input)
+        try:
+            if os.path.exists(tmp_video):
+                os.remove(tmp_video)
+        except Exception:
+            pass
         return False
 
     hands = mp_hands.Hands(
@@ -449,20 +490,7 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     while True:
         if cancel_event is not None and cancel_event.is_set():
             logger.info("Processing canceled by user")
-            cap.release()
-            out.release()
-            hands.close()
-            try:
-                if os.path.exists(tmp_video):
-                    os.remove(tmp_video)
-            except Exception:
-                pass
-            if created_tmp and os.path.exists(work_input):
-                try:
-                    os.remove(work_input)
-                except Exception:
-                    pass
-            return False
+            break
 
         ret, frame = cap.read()
         if not ret:
@@ -549,10 +577,10 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
         if frame_idx % 60 == 0:
             logger.info("Progress: %d/%d frames", frame_idx, total_frames)
 
+    # Close resources
     cap.release()
     out.release()
     hands.close()
-    logger.info("Frame processing finished: %d frames", frame_idx)
 
     if created_tmp and os.path.exists(work_input):
         try:
@@ -560,12 +588,17 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
         except Exception:
             pass
 
-    # small pause to ensure file flush
+    # small pause to ensure flush
     import time
     time.sleep(0.3)
 
     if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 1000:
         logger.error("Intermediate video not created or empty")
+        try:
+            if os.path.exists(tmp_video):
+                os.remove(tmp_video)
+        except Exception:
+            pass
         return False
 
     logger.info("Intermediate video created: %d bytes", os.path.getsize(tmp_video))
@@ -597,16 +630,7 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg (video+audio) timeout")
 
-    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
-        logger.info("First ffmpeg pass failed, trying video-only")
-        cmd2 = ["ffmpeg", "-y", "-i", tmp_video, "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
-        try:
-            r2 = subprocess.run(cmd2, capture_output=True, timeout=300)
-            if r2.returncode != 0:
-                logger.error("ffmpeg (video only) rc=%d stderr=%s", r2.returncode, r2.stderr.decode(errors="ignore")[-800:])
-        except subprocess.TimeoutExpired:
-            logger.error("ffmpeg (video only) timeout")
-
+    # cleanup intermediate
     try:
         if os.path.exists(tmp_video):
             os.remove(tmp_video)
@@ -631,7 +655,7 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
         logger.error("ffprobe check exception: %s", e)
         return False
 
-    logger.info("Video processed and verified successfully")
+    logger.info("Video processed and verified successfully: %s", output_path)
     return True
 
 
@@ -709,8 +733,6 @@ HELP_TEXT = (
     "- Держите руки в кадре несколько кадров, не прячьте их на доли секунды.\n"
     "- Если рамка дрожит, попробуйте поменьше резких движений или помедленнее двигаться.\n"
 )
-
-# Handlers
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -830,7 +852,6 @@ def build_app(token: str):
     # Explicit media handlers
     app.add_handler(MessageHandler(filters.VIDEO, handle_media))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_media))
-    # documents with videos handled in handler check
     app.add_handler(MessageHandler(filters.Document.ALL, handle_media))
 
     # fallback for text
