@@ -15,8 +15,12 @@ from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import Conflict as TGConflict
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
 )
 
 # ---------- CONFIG ----------
@@ -35,14 +39,13 @@ mp_hands = mp.solutions.hands
 INDEX_TIP = 8
 THUMB_TIP = 4
 
-# Available colors
 COLORS = {
     "purple": {"name": "🟣 Пурпурный", "bgr": (255, 0, 200)},
-    "blue":   {"name": "🔵 Синий",     "bgr": (255, 100, 0)},
-    "green":  {"name": "🟢 Зелёный",   "bgr": (60, 255, 60)},
-    "red":    {"name": "🔴 Красный",   "bgr": (40, 30, 230)},
-    "yellow": {"name": "🟡 Жёлтый",    "bgr": (40, 230, 230)},
-    "white":  {"name": "⚪ Белый",     "bgr": (240, 240, 240)},
+    "blue": {"name": "🔵 Синий", "bgr": (255, 100, 0)},
+    "green": {"name": "🟢 Зелёный", "bgr": (60, 255, 60)},
+    "red": {"name": "🔴 Красный", "bgr": (40, 30, 230)},
+    "yellow": {"name": "🟡 Жёлтый", "bgr": (40, 230, 230)},
+    "white": {"name": "⚪ Белый", "bgr": (240, 240, 240)},
 }
 
 FONT_PATHS = [
@@ -265,7 +268,9 @@ def ffprobe_duration(path):
     try:
         p = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if p.returncode == 0 and p.stdout.strip():
             return float(p.stdout.strip())
@@ -275,10 +280,6 @@ def ffprobe_duration(path):
 
 
 def prepare_work_input(input_path, max_seconds=20):
-    """
-    Convert / trim input to mp4/h264 (mp4) up to max_seconds.
-    Returns (work_input_path, created_tmp_bool)
-    """
     duration = ffprobe_duration(input_path)
     need_trim = False
     if duration is not None and duration > max_seconds + 0.01:
@@ -290,9 +291,25 @@ def prepare_work_input(input_path, max_seconds=20):
     out_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     out_tmp.close()
     cmd = [
-        "ffmpeg", "-y", "-i", input_path, "-ss", "0", "-t", str(max_seconds),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-movflags", "+faststart", out_tmp.name
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-ss",
+        "0",
+        "-t",
+        str(max_seconds),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        out_tmp.name,
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=120)
@@ -314,19 +331,17 @@ def prepare_work_input(input_path, max_seconds=20):
         return input_path, False
 
 
-# ---------- CORE VIDEO PROCESSING with robust fallback to image-sequence ----------
+# ---------- CORE VIDEO PROCESSING with robust fallback ----------
 
 
 def _process_video_inner(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
     work_input, created_tmp = prepare_work_input(input_path, max_seconds=20)
-
     cap = cv2.VideoCapture(work_input)
     if not cap.isOpened():
         logger.error("cv2 cannot open video %s", work_input)
         if created_tmp and os.path.exists(work_input):
             os.remove(work_input)
         return False
-
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     if fps <= 1.0:
         try:
@@ -338,15 +353,11 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                 fps = 25.0
         except Exception:
             fps = 25.0
-
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
-
-    # try VideoWriter first (fast), fallback to image-sequence+ffmpeg if it fails
     tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_video_path = tmp_video.name
     tmp_video.close()
-
     fourcc_candidates = ["mp4v", "X264", "avc1", "H264"]
     out = None
     for fc in fourcc_candidates:
@@ -364,23 +375,19 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                 out = None
         except Exception:
             out = None
-
     use_image_seq = out is None or not out.isOpened()
     frames_dir = None
     frame_idx = 0
     if use_image_seq:
         frames_dir = tempfile.mkdtemp(prefix="frames_")
         logger.info("VideoWriter unavailable, will write frames to %s and assemble with ffmpeg", frames_dir)
-
     hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.3, min_tracking_confidence=0.3, model_complexity=0)
-
     prev_pts = None
     prev_center = None
     prev_area = None
     pts_history = deque(maxlen=5)
     area_history = deque(maxlen=5)
     outlier_count = 0
-
     smooth_base = 0.8
     smooth_min = 0.2
     jump_quick = max(w, h) * 0.12
@@ -389,25 +396,20 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     area_ratio_max = 2.0
     miss_count = 0
     MAX_MISS = 6
-
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     logger.info("Start processing: %dx%d, ~%d frames, fps=%.2f", w, h, total_frames, fps)
-
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 logger.info("Processing canceled by user")
                 return False
-
             ret, frame = cap.read()
             if not ret:
                 break
-
             try:
                 raw_points = detect_hands(hands, frame, w, h)
                 raw_points = dedupe_hands(raw_points)
                 pair = pick_best_pair(raw_points, prev_center)
-
                 valid_update = False
                 if pair is not None:
                     try:
@@ -458,7 +460,6 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                                 valid_update = True
                     except Exception:
                         valid_update = False
-
                 if not valid_update:
                     miss_count += 1
                     if prev_pts is not None and miss_count <= MAX_MISS:
@@ -471,19 +472,14 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                         area_history.clear()
             except Exception as e:
                 logger.warning("Frame %d: unexpected error, writing frame without effect: %s", frame_idx, e)
-
-            # write frame
             if not use_image_seq:
                 out.write(frame)
             else:
-                # save as PNG (lossless) for ffmpeg assembly
                 fname = os.path.join(frames_dir, f"frame_{frame_idx:06d}.png")
                 cv2.imwrite(fname, frame)
             frame_idx += 1
-
             if frame_idx % 60 == 0:
                 logger.info("Progress: %d/%d frames", frame_idx, total_frames)
-
     finally:
         cap.release()
         if out is not None:
@@ -492,12 +488,9 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
             except Exception:
                 pass
         hands.close()
-
-    # if used image sequence, assemble with ffmpeg
     if use_image_seq:
         if frame_idx == 0:
             logger.error("No frames rendered")
-            # cleanup frames_dir
             try:
                 if os.path.exists(frames_dir):
                     import shutil
@@ -510,7 +503,6 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                 except Exception:
                     pass
             return False
-        # assemble
         cmd = [
             "ffmpeg", "-y", "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "frame_%06d.png"),
@@ -520,7 +512,6 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
             r = subprocess.run(cmd, capture_output=True, timeout=300)
             if r.returncode != 0:
                 logger.error("ffmpeg assemble frames failed: %s", r.stderr.decode(errors="ignore")[-500:])
-                # cleanup frames_dir
                 import shutil
                 try:
                     shutil.rmtree(frames_dir)
@@ -545,16 +536,12 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                 except Exception:
                     pass
             return False
-        # cleanup frames
         import shutil
         try:
             shutil.rmtree(frames_dir)
         except Exception:
             pass
-
     logger.info("Intermediate video created: %s (%d bytes)", tmp_video_path, os.path.getsize(tmp_video_path) if os.path.exists(tmp_video_path) else 0)
-
-    # final merge with original audio (if any)
     cmd = ["ffmpeg", "-y", "-i", tmp_video_path, "-i", input_path, "-c:v", "libx264", "-c:a", "aac",
            "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-pix_fmt", "yuv420p", output_path]
     try:
@@ -587,20 +574,16 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
             except Exception:
                 pass
         return False
-
     try:
         if os.path.exists(tmp_video_path):
             os.remove(tmp_video_path)
     except Exception:
         pass
-
     if created_tmp and os.path.exists(work_input):
         try:
             os.remove(work_input)
         except Exception:
             pass
-
-    # quick validation via ffprobe
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "csv=p=0", output_path],
@@ -612,7 +595,6 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     except Exception as e:
         logger.error("ffprobe check exception: %s", e)
         return False
-
     logger.info("Video processed and verified successfully: %s", output_path)
     return True
 
@@ -626,12 +608,12 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
         return False
 
 
-# ---------- Async wrapper + Telegram integration ----------
+# ---------- run_and_send (robust send) ----------
 
 
 async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input_path: str, custom_text=None, color_bgr=(255, 0, 200)):
     msg = update.effective_message
-    status_msg = await msg.reply_text("🔄 Получено, скачиваю и обрабатываю видео...")
+    status_msg = await msg.reply_text("🔄 Получено, обрабатываю видео...")
     output_path = input_path + "_out.mp4"
     cancel_event = threading.Event()
     context.user_data["cancel_event"] = cancel_event
@@ -645,26 +627,54 @@ async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input
             await status_msg.edit_text("❌ Не удалось обработать видео или задача была отменена.")
             return
 
-        await status_msg.edit_text("✅ Готово, отправляю результат...")
-        # Prefer send as video_note if input was video_note, fallback to normal video
-        media_kind = context.user_data.get("media_kind", "video")
+        await asyncio.sleep(0.3)  # filesystem safety
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 2000:
+            await status_msg.edit_text("❌ После обработки файл не найден или слишком мал.")
+            logger.error("Output missing or too small: %s size=%d", output_path, os.path.getsize(output_path) if os.path.exists(output_path) else 0)
+            return
+
+        # check geometry for video_note suitability
         try:
-            if media_kind == "video_note":
-                # Try to send as video_note
-                await msg.reply_video_note(video=InputFile(output_path))
-            else:
-                await msg.reply_video(video=InputFile(output_path))
-        except Exception as e:
-            logger.warning("Send as preferred media failed: %s — falling back to reply_video", e)
-            try:
-                await msg.reply_video(video=InputFile(output_path))
-            except Exception as e2:
-                logger.exception("Failed to send processed video: %s", e2)
-                await msg.reply_text("Готово, но не удалось отправить файл — см. логи сервера.")
-        try:
-            await status_msg.delete()
+            cap = cv2.VideoCapture(output_path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            cap.release()
         except Exception:
-            pass
+            w = h = 0
+
+        is_almost_square = False
+        if w > 0 and h > 0:
+            is_almost_square = abs(w - h) <= max(1, int(0.02 * max(w, h)))
+
+        media_kind = context.user_data.get("media_kind", "video")
+
+        try:
+            with open(output_path, "rb") as f:
+                input_file = InputFile(f, filename=os.path.basename(output_path))
+                prefer_video_note = (media_kind == "video_note")
+                if prefer_video_note and is_almost_square:
+                    await status_msg.edit_text("📮 Отправляю как video_note...")
+                    try:
+                        await context.bot.send_video_note(chat_id=msg.chat_id, video_note=input_file, reply_to_message_id=msg.message_id)
+                        try:
+                            await status_msg.delete()
+                        except Exception:
+                            pass
+                        return
+                    except Exception as e:
+                        logger.warning("send_video_note failed, fallback to send_video: %s", e)
+                await status_msg.edit_text("📮 Отправляю как обычное видео...")
+                f.seek(0)
+                await msg.reply_video(video=InputFile(f, filename=os.path.basename(output_path)))
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("Failed to open/send processed file: %s", e)
+            await status_msg.edit_text("❌ Ошибка при отправке файла. Проверь логи сервера.")
+            return
     finally:
         try:
             if os.path.exists(output_path):
@@ -673,7 +683,7 @@ async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input
             pass
 
 
-# ---------- Telegram UI: color & text selection ----------
+# ---------- Telegram UI: color/text selection ----------
 
 
 def color_keyboard(selected_key=None):
@@ -696,17 +706,12 @@ def color_keyboard(selected_key=None):
     return InlineKeyboardMarkup(kb)
 
 
-START_TEXT = "Привет! Нажми на цвет рамки и (опционально) задай текст для отображения. Затем отправь видео."
-
+START_TEXT = "Привет! Нажми на цвет рамки и/или задай текст, затем отправь видео (до 20s)."
 HELP_TEXT = (
-    "Как пользоваться:\n"
-    "1) Нажми Start -> выбери цвет и/или нажми «Задать текст» и пришли сообщение с текстом.\n"
-    "2) Отправь видео (файл, видеосообщение или документ с видео). Длина до 20s (автоматически обрежу).\n"
-    "3) Если нужно остановить обработку — нажми /cancel или кнопку Cancel.\n"
+    "Как пользоваться:\n1) Нажми Start -> выбери цвет и/или 'Задать текст'.\n"
+    "2) Отправь видео (файл/video_note/document). Длина до 20s (автоматически обрежу).\n"
+    "3) Нажми /cancel чтобы прервать обработку."
 )
-
-
-# Handlers
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -751,9 +756,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("Неизвестный цвет.")
     elif data == "set_text":
         context.user_data["awaiting_text"] = True
-        await query.message.reply_text("Пришли мне текст, который нужно отобразить в рамке (или отправь /cancel_text чтобы отменить).")
+        await query.message.reply_text("Пришли текст для рамки (или /cancel_text).")
     elif data == "ready":
-        await query.message.reply_text("Ок. Теперь отправь видео (файл, видеосообщение или документ с видео).")
+        await query.message.reply_text("Теперь отправь видео (файл/video_note/document).")
     elif data == "btn_cancel":
         ev = context.user_data.get("cancel_event")
         if ev and isinstance(ev, threading.Event):
@@ -777,10 +782,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("awaiting_text", None)
         await update.effective_message.reply_text(f"Текст сохранён: {text}", reply_markup=color_keyboard(context.user_data.get("color_key")))
     else:
-        await update.effective_message.reply_text("Я ожидаю видео. Нажми /help для инструкции.")
-
-
-# Media handler
+        await update.effective_message.reply_text("Я жду видео. Нажми /help для инструкции.")
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -798,9 +800,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_obj = await msg.document.get_file()
         media_kind = "document"
     else:
-        await msg.reply_text("Пожалуйста, отправь видео (файл, видеосообщение или документ с видео).")
+        await msg.reply_text("Пожалуйста, отправь видео (файл/video_note/document).")
         return
-
     tmpf = tempfile.NamedTemporaryFile(suffix=".input", delete=False)
     tmpf.close()
     try:
@@ -814,25 +815,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-
-    # store kind so run_and_send can decide how to send back
     context.user_data["media_kind"] = media_kind
-
-    # choose color & text
     key = context.user_data.get("color_key", "purple")
     color_bgr = COLORS.get(key, COLORS["purple"])["bgr"]
     custom_text = context.user_data.get("custom_text")
-
     await run_and_send(update, context, tmpf.name, custom_text=custom_text, color_bgr=color_bgr)
-
     try:
         if os.path.exists(tmpf.name):
             os.remove(tmpf.name)
     except Exception:
         pass
-
-
-# ---------- App building & run ----------
 
 
 def build_app(token: str):
@@ -859,7 +851,7 @@ if __name__ == "__main__":
             logger.info("Starting polling mode")
             application.run_polling()
     except TGConflict:
-        logger.warning("Conflict detected: trying delete_webhook() and fallback to polling")
+        logger.warning("Conflict detected: attempting delete_webhook() and fallback to polling")
         try:
             bot = application.bot
             asyncio.run(bot.delete_webhook(timeout=10))
