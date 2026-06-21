@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import logging
 import asyncio
@@ -7,11 +8,13 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from PIL import Image, ImageDraw, ImageFont
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
+from collections import deque
+import threading
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -32,7 +35,6 @@ COLORS = {
     "white":  {"name": "⚪ Белый",     "bgr": (240, 240, 240)},
 }
 
-# Путь к юникод-шрифту (DejaVu идёт в комплекте с большинством Linux-систем/Docker-образов)
 FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
@@ -50,11 +52,6 @@ FONT_PATH = find_font()
 
 
 def _finger_extended(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
-    """
-    Проверяет вытянут ли палец, сравнивая расстояния от запястья,
-    а не только Y-координаты — работает при любом повороте руки/камеры
-    (важно для круглых кружков с fisheye-искажением).
-    """
     wrist = np.array([lm[wrist_idx].x, lm[wrist_idx].y])
     tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
     pip = np.array([lm[pip_idx].x, lm[pip_idx].y])
@@ -64,12 +61,10 @@ def _finger_extended(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
     dist_pip = np.linalg.norm(pip - wrist)
     dist_mcp = np.linalg.norm(mcp - wrist)
 
-    # Палец вытянут, если кончик заметно дальше от запястья, чем сустав
     return dist_tip > dist_pip * 1.05 and dist_tip > dist_mcp * 1.15
 
 
 def _finger_curled(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
-    """Проверяет согнут ли палец (кончик не дальше от запястья, чем средний сустав)"""
     wrist = np.array([lm[wrist_idx].x, lm[wrist_idx].y])
     tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
     pip = np.array([lm[pip_idx].x, lm[pip_idx].y])
@@ -83,13 +78,10 @@ def _finger_curled(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
 def get_hand_points(hand_landmarks, w, h):
     lm = hand_landmarks.landmark
 
-    # Указательный должен быть явно вытянут — это главный признак жеста
     index_extended = _finger_extended(lm, 8, 6, 5)
     if not index_extended:
         return None
 
-    # Средний/безымянный/мизинец должны быть заметно короче указательного (согнуты).
-    # Требуем минимум 2 из 3 — иначе открытая ладонь тоже проходила бы проверку.
     wrist = np.array([lm[0].x, lm[0].y])
     index_tip = np.array([lm[8].x, lm[8].y])
     dist_index = np.linalg.norm(index_tip - wrist)
@@ -99,16 +91,15 @@ def get_hand_points(hand_landmarks, w, h):
     for tip_idx in other_tips:
         tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
         dist_tip = np.linalg.norm(tip - wrist)
-        if dist_tip < dist_index * 0.75:  # заметно короче, не просто чуть-чуть
+        if dist_tip < dist_index * 0.75:
             curled_count += 1
 
     if curled_count < 2:
         return None
 
-    # Большой палец должен быть отведён в сторону от указательного (не прижат к ладони)
     thumb_tip = np.array([lm[THUMB_TIP].x, lm[THUMB_TIP].y])
     thumb_index_dist = np.linalg.norm(thumb_tip - index_tip)
-    if thumb_index_dist < dist_index * 0.3:  # слишком близко к указательному — не похоже на L
+    if thumb_index_dist < dist_index * 0.3:
         return None
 
     ix = int(lm[INDEX_TIP].x * w)
@@ -119,11 +110,6 @@ def get_hand_points(hand_landmarks, w, h):
 
 
 def preprocess_for_detection(frame):
-    """
-    Улучшает кадр для более точного распознавания рук:
-    - CLAHE для контраста (помогает в плохом освещении)
-    - Лёгкая резкость
-    """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -131,20 +117,13 @@ def preprocess_for_detection(frame):
     lab = cv2.merge((l, a, b))
     enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    # Лёгкая нерезкая маска для повышения детализации краёв пальцев
     blurred = cv2.GaussianBlur(enhanced, (0, 0), 3)
     sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
     return sharpened
 
 
 def detect_hands(hands_detector, frame, w, h):
-    """
-    Быстрая детекция рук с L-жестом на одном масштабе.
-    Если кадр большой — даунскейлим перед детекцией (MediaPipe всё равно работает
-    на низком внутреннем разрешении, гонять полный кадр — трата времени).
-    Возвращает список (index_tip, thumb_tip) в координатах ОРИГИНАЛЬНОГО кадра.
-    """
-    MAX_SIDE = 640  # выше этого — даунскейлим для скорости; 640 достаточно и для кружков, и для видео
+    MAX_SIDE = 640
     scale = 1.0
     search_frame = frame
 
@@ -177,8 +156,7 @@ def detect_hands(hands_detector, frame, w, h):
     return found
 
 
-def dedupe_hands(hand_points, dist_threshold=40):
-    """Убирает дубликаты одной и той же руки, найденной на разных масштабах"""
+def dedupe_hands(hand_points, dist_threshold=60):
     unique = []
     for idx_pt, thm_pt in hand_points:
         is_dup = False
@@ -193,13 +171,6 @@ def dedupe_hands(hand_points, dist_threshold=40):
 
 
 def pick_best_pair(hand_points, prev_center=None):
-    """
-    Если найдено больше 2 рук с L-жестом (несколько людей в кадре),
-    выбирает пару, которая:
-    1) Образует валидный (не вырожденный) четырёхугольник
-    2) Если есть прошлая позиция — ближайшую к ней (стабильность между кадрами)
-    3) Иначе — пару с наибольшей площадью получившейся фигуры
-    """
     if len(hand_points) < 2:
         return None
     if len(hand_points) == 2:
@@ -211,7 +182,7 @@ def pick_best_pair(hand_points, prev_center=None):
         try:
             quad = make_quad(a, b)
             area = cv2.contourArea(quad)
-            if area < 150:  # слишком маленький/вырожденный — пропускаем
+            if area < 150:
                 continue
             center = quad.mean(axis=0)
             candidates.append((area, center, a, b))
@@ -222,10 +193,8 @@ def pick_best_pair(hand_points, prev_center=None):
         return None
 
     if prev_center is not None:
-        # Выбираем пару с центром ближе к прошлому положению
         candidates.sort(key=lambda c: np.linalg.norm(c[1] - prev_center))
     else:
-        # Иначе берём самую большую фигуру
         candidates.sort(key=lambda c: -c[0])
 
     _, _, a, b = candidates[0]
@@ -250,21 +219,15 @@ def make_quad(hand_a, hand_b):
 
 
 def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
-    """
-    Рисует текст любого языка (кириллица, эмодзи, иероглифы и т.д.) через PIL
-    с glow-эффектом, возвращает BGR numpy массив.
-    """
     if not FONT_PATH:
-        return img_bgr  # нет шрифта — пропускаем текст
+        return img_bgr
 
     h, w = img_bgr.shape[:2]
-    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])  # BGR -> RGB
+    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
 
-    # Подбираем размер шрифта под ширину фигуры
     font_size = max(14, min(60, int(box_width / (len(text) * 0.62 + 1))))
     font = ImageFont.truetype(FONT_PATH, font_size)
 
-    # Слой для glow (RGBA)
     glow_img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw_glow = ImageDraw.Draw(glow_img)
     bbox = draw_glow.textbbox((0, 0), text, font=font)
@@ -281,7 +244,6 @@ def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
     img_bgr[:] = (img_bgr.astype(np.float32) * (1 - glow_alpha) +
                   glow_bgr.astype(np.float32) * glow_alpha).astype(np.uint8)
 
-    # Чёткий текст поверх
     sharp_np = cv2.cvtColor(np.array(glow_img), cv2.COLOR_RGBA2BGRA)
     sharp_bgr = sharp_np[:, :, :3]
     sharp_alpha = sharp_np[:, :, 3:4].astype(np.float32) / 255.0
@@ -293,10 +255,6 @@ def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
 
 
 def apply_quad_effect(frame, pts, text=None, color_bgr=(255, 0, 200)):
-    """
-    Применяет эффект только в bounding box фигуры, а не на всём кадре —
-    значительно быстрее и легче по памяти, особенно на больших видео.
-    """
     H, W = frame.shape[:2]
 
     x1 = max(0, int(pts[:, 0].min()) - 2)
@@ -311,6 +269,10 @@ def apply_quad_effect(frame, pts, text=None, color_bgr=(255, 0, 200)):
     pts_local = pts.copy()
     pts_local[:, 0] -= x1
     pts_local[:, 1] -= y1
+
+    pts_local = pts_local.astype(np.int32)
+    pts_local[:, 0] = np.clip(pts_local[:, 0], 0, x2 - x1 - 1)
+    pts_local[:, 1] = np.clip(pts_local[:, 1], 0, y2 - y1 - 1)
 
     mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
     cv2.fillPoly(mask, [pts_local], 255)
@@ -338,7 +300,7 @@ def apply_quad_effect(frame, pts, text=None, color_bgr=(255, 0, 200)):
     roi_result = (roi.astype(np.float32) * (1 - mask3) + effect.astype(np.float32) * mask3).astype(np.uint8)
 
     glow_layer = roi_result.copy()
-    cv2.polylines(glow_layer, [pts_local], True, color_bgr, 14)
+    cv2.polylines(glow_layer, [pts_local], True, color_bgr, max(2, int(round(min(W, H) * 0.02))))
     roi_result = cv2.addWeighted(roi_result, 0.72, glow_layer, 0.28, 0)
     cv2.polylines(roi_result, [pts_local], True, color_bgr, 2)
 
@@ -346,8 +308,67 @@ def apply_quad_effect(frame, pts, text=None, color_bgr=(255, 0, 200)):
     return frame
 
 
-def _process_video_inner(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200)):
-    cap = cv2.VideoCapture(input_path)
+def ffprobe_duration(path):
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10
+        )
+        if p.returncode == 0 and p.stdout.strip():
+            return float(p.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def prepare_work_input(input_path, max_seconds=20):
+    duration = ffprobe_duration(input_path)
+    need_trim = False
+    if duration is not None and duration > max_seconds + 0.01:
+        need_trim = True
+
+    ext = os.path.splitext(input_path)[1].lower()
+    need_convert = ext not in (".mp4", ".mov", ".m4v")
+
+    if not need_trim and not need_convert:
+        return input_path, False
+
+    out_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out_tmp.close()
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-ss", "0", "-t", str(max_seconds),
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "+faststart", out_tmp.name]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        if r.returncode == 0 and os.path.exists(out_tmp.name) and os.path.getsize(out_tmp.name) > 1000:
+            return out_tmp.name, True
+        else:
+            logger.warning(f"ffmpeg convert failed, fallback to input. stderr: {r.stderr.decode(errors='ignore')[-400:]}")
+            try:
+                os.unlink(out_tmp.name)
+            except Exception:
+                pass
+            return input_path, False
+    except Exception as e:
+        logger.warning(f"ffmpeg convert exception: {e}")
+        try:
+            os.unlink(out_tmp.name)
+        except Exception:
+            pass
+        return input_path, False
+
+
+def _process_video_inner(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
+    # Подготовка входа: конвертируем/обрезаем до 20s, если нужно
+    work_input, created_tmp = prepare_work_input(input_path, max_seconds=20)
+
+    cap = cv2.VideoCapture(work_input)
+    if not cap.isOpened():
+        logger.error("cv2 не открыл видео")
+        if created_tmp and os.path.exists(work_input):
+            os.remove(work_input)
+        return False
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -355,27 +376,59 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     tmp_video = input_path + "_tmp.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(tmp_video, fourcc, fps, (w, h))
+    if not out.isOpened():
+        logger.error("cv2 VideoWriter не открылся")
+        cap.release()
+        if created_tmp and os.path.exists(work_input):
+            os.remove(work_input)
+        return False
 
     hands = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=2,
         min_detection_confidence=0.3,
         min_tracking_confidence=0.3,
-        model_complexity=0,  # лёгкая модель — критично для скорости на слабом CPU; жест компенсирован мягкой проверкой
+        model_complexity=0,
     )
 
     prev_pts = None
     prev_center = None
-    smooth = 0.55          # выше = быстрее реагирует на резкие движения рук
+    prev_area = None
+    pts_history = deque(maxlen=5)
+    area_history = deque(maxlen=5)
+    outlier_count = 0
+
+    smooth_base = 0.8
+    smooth_min = 0.2
+    jump_quick = max(w, h) * 0.12
+    MAX_JUMP = max(w, h) * 0.9
+    area_ratio_min = 0.5
+    area_ratio_max = 2.0
     miss_count = 0
-    MAX_MISS = 3          # короткое удержание (0.1 сек при 30fps) — не "зависает" после ухода рук
-    MAX_JUMP = max(w, h) * 0.9  # резкие движения не должны отбрасываться как "выброс"
+    MAX_MISS = 6
 
     frame_idx = 0
     total_frames_estimate = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     logger.info(f"Начинаю обработку: {w}x{h}, ~{total_frames_estimate} кадров, fps={fps:.2f}")
 
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info("Обработка отменена пользователем")
+            cap.release()
+            out.release()
+            hands.close()
+            try:
+                if os.path.exists(tmp_video):
+                    os.remove(tmp_video)
+            except Exception:
+                pass
+            if created_tmp and os.path.exists(work_input):
+                try:
+                    os.remove(work_input)
+                except Exception:
+                    pass
+            return False
+
         ret, frame = cap.read()
         if not ret:
             break
@@ -392,25 +445,54 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                     area = cv2.contourArea(quad)
                     new_center = quad.mean(axis=0)
 
-                    if area >= 150:
-                        if prev_center is None:
-                            valid_update = True
-                        else:
-                            jump = np.linalg.norm(new_center - prev_center)
-                            # При резком движении (большой скачок) доверяем новой позиции сразу,
-                            # а не ждём — иначе фигура "не успевает" за быстрыми руками
-                            valid_update = True
+                    if area < 150:
+                        raise ValueError("area too small")
 
-                    if valid_update:
-                        if prev_pts is None:
-                            prev_pts = quad.astype(np.float32)
-                        else:
-                            prev_pts = prev_pts * (1 - smooth) + quad.astype(np.float32) * smooth
+                    if prev_center is None or prev_pts is None:
+                        prev_pts = quad.astype(np.float32)
                         prev_center = prev_pts.mean(axis=0)
+                        prev_area = area
+                        pts_history.clear()
+                        area_history.clear()
+                        pts_history.append(prev_pts.copy())
+                        area_history.append(prev_area)
                         frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
                         miss_count = 0
+                        valid_update = True
+                    else:
+                        jump = np.linalg.norm(new_center - prev_center)
+                        area_ratio = area / (prev_area + 1e-6)
+
+                        if jump > MAX_JUMP or not (area_ratio_min <= area_ratio <= area_ratio_max):
+                            outlier_count += 1
+                            logger.debug(f"Выброс детекции: jump={jump:.1f}, area_ratio={area_ratio:.2f}, outlier_count={outlier_count}")
+                            if outlier_count >= 3:
+                                alpha = 1.0 - smooth_min
+                                prev_pts = prev_pts * (1 - alpha) + quad.astype(np.float32) * alpha
+                                prev_center = prev_pts.mean(axis=0)
+                                prev_area = prev_area * 0.7 + area * 0.3
+                                pts_history.append(prev_pts.copy())
+                                area_history.append(prev_area)
+                                frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
+                                miss_count = 0
+                                valid_update = True
+                        else:
+                            outlier_count = 0
+                            pts_history.append(quad.astype(np.float32))
+                            area_history.append(area)
+                            if jump > jump_quick:
+                                alpha = 1.0 - smooth_min
+                            else:
+                                alpha = 1.0 - smooth_base
+
+                            prev_pts = prev_pts * (1 - alpha) + quad.astype(np.float32) * alpha
+                            prev_center = prev_pts.mean(axis=0)
+                            prev_area = prev_area * 0.85 + area * 0.15
+                            frame = apply_quad_effect(frame, prev_pts.astype(np.int32), custom_text, color_bgr)
+                            miss_count = 0
+                            valid_update = True
                 except Exception as e:
-                    logger.warning(f"Кадр {frame_idx}: ошибка построения фигуры: {e}")
+                    logger.debug(f"Кадр {frame_idx}: ошибка построения фигуры: {e}")
                     valid_update = False
 
             if not valid_update:
@@ -420,9 +502,10 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                 else:
                     prev_pts = None
                     prev_center = None
+                    prev_area = None
+                    pts_history.clear()
+                    area_history.clear()
         except Exception as e:
-            # Любая неожиданная ошибка на кадре — просто пишем кадр как есть, без эффекта,
-            # и идём дальше. Никогда не обрываем обработку всего видео из-за одного кадра.
             logger.warning(f"Кадр {frame_idx}: непредвиденная ошибка, пишу без эффекта: {e}")
 
         out.write(frame)
@@ -436,23 +519,18 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     hands.close()
     logger.info(f"Обработка кадров завершена: {frame_idx} кадров записано из ~{total_frames_estimate} ожидаемых")
 
-    if total_frames_estimate > 0 and frame_idx < total_frames_estimate * 0.5:
-        logger.error(
-            f"Обработано подозрительно мало кадров ({frame_idx} из {total_frames_estimate}) — "
-            f"вероятен сбой декодирования исходного видео или MediaPipe"
-        )
+    if created_tmp and os.path.exists(work_input):
+        try:
+            os.remove(work_input)
+        except Exception:
+            pass
 
-    # Небольшая пауза, чтобы файловый дескриптор гарантированно сбросился на диск
-    # перед тем как ffmpeg попытается его прочитать (актуально на медленных/нагруженных системах)
     import time
     time.sleep(0.3)
 
-    # Проверяем что промежуточное видео реально записалось и не пустое
     if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 1000:
         logger.error("Промежуточное видео не создалось или пустое")
         return False
-
-    logger.info(f"Промежуточное видео создано: {os.path.getsize(tmp_video)} байт")
 
     cmd = ["ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
            "-c:v", "libx264", "-c:a", "aac",
@@ -477,13 +555,14 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
             logger.error("ffmpeg (только видео) превысил таймаут")
 
     if os.path.exists(tmp_video):
-        os.remove(tmp_video)
+        try:
+            os.remove(tmp_video)
+        except Exception:
+            pass
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
         logger.error("Финальный output.mp4 не создался или пустой после обоих проходов ffmpeg")
         return False
-
-    logger.info(f"Финальное видео создано: {os.path.getsize(output_path)} байт")
 
     try:
         probe = subprocess.run(
@@ -502,236 +581,198 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     return True
 
 
-def process_video(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200)):
-    """
-    Безопасная обёртка: ловит АБСОЛЮТНО любое исключение (включая краши на конкретных кадрах,
-    ошибки памяти, проблемы с кодеками) и логирует полный traceback, вместо того чтобы
-    дать процессу тихо умереть без объяснений.
-    """
+def process_video(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
     import traceback
     try:
-        return _process_video_inner(input_path, output_path, custom_text, color_bgr)
+        return _process_video_inner(input_path, output_path, custom_text, color_bgr, cancel_event=cancel_event)
     except Exception as e:
         logger.error(f"КРИТИЧЕСКАЯ ошибка в process_video: {e}\n{traceback.format_exc()}")
         return False
 
 
-async def run_and_send(update, context, input_path, custom_text=None, color_bgr=(255, 0, 200)):
+async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input_path: str, custom_text=None, color_bgr=(255, 0, 200)):
     msg = update.effective_message
     status_msg = await msg.reply_text("🔄 Обрабатываю видео, это может занять некоторое время...")
     output_path = input_path + "_out.mp4"
+    # создаём событие отмены и сохраняем в user_data, чтобы cancel handler мог его выставить
+    cancel_event = threading.Event()
+    context.user_data["cancel_event"] = cancel_event
+
     try:
         loop = asyncio.get_event_loop()
         success = await loop.run_in_executor(
-            None, process_video, input_path, output_path, custom_text, color_bgr
+            None, process_video, input_path, output_path, custom_text, color_bgr, cancel_event
         )
+
+        # очистим cancel_event
+        context.user_data.pop("cancel_event", None)
 
         if not success:
             await status_msg.edit_text(
-                "❌ Не удалось обработать видео. Возможно, оно слишком длинное/тяжёлое — "
-                "попробуй покороче (до 15-20 секунд) или с меньшим разрешением."
+                "❌ Не удалось обработать видео или обработка была отменена."
             )
             return
 
-        media_kind = context.user_data.get("media_kind", "video_note")
-
-        try:
-            if media_kind == "video_note":
-                vn = context.user_data.get("video_note_meta", {})
-                with open(output_path, "rb") as f:
-                    await context.bot.send_video_note(
-                        chat_id=msg.chat_id,
-                        video_note=f,
-                        duration=vn.get("duration"),
-                        length=vn.get("length"),
-                        read_timeout=120,
-                        write_timeout=120,
-                        connect_timeout=60,
-                    )
-            else:
-                with open(output_path, "rb") as f:
-                    await context.bot.send_video(
-                        chat_id=msg.chat_id,
-                        video=f,
-                        supports_streaming=True,
-                        read_timeout=120,
-                        write_timeout=120,
-                        connect_timeout=60,
-                    )
-            await status_msg.delete()
-        except Exception as e:
-            logger.error(f"Ошибка отправки видео: {e}", exc_info=True)
-            await status_msg.edit_text(f"❌ Готово, но не получилось отправить: {e}")
-    except Exception as e:
-        logger.error(f"Ошибка обработки видео: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Ошибка обработки: {e}")
+        await status_msg.edit_text("✅ Готово, отправляю результат...")
+        await msg.reply_video(video=InputFile(output_path))
+        await status_msg.delete()
     finally:
-        for p in (input_path, output_path):
-            if os.path.exists(p):
-                os.remove(p)
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+        # не удаляем входной файл — вызывающая логика должна это делать
 
 
-MAX_DURATION_SECONDS = 60  # ограничение на длину видео — длиннее будет обрабатываться слишком долго
+# ========== Telegram handlers: start/help/cancel/buttons + media handler ==========
+
+def main_keyboard():
+    kb = [
+        [InlineKeyboardButton("▶️ Start", callback_data="btn_start"),
+         InlineKeyboardButton("❓ Help", callback_data="btn_help")],
+        [InlineKeyboardButton("⛔ Cancel", callback_data="btn_cancel")]
+    ]
+    return InlineKeyboardMarkup(kb)
 
 
-async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-
-    if msg.video_note.duration and msg.video_note.duration > MAX_DURATION_SECONDS:
-        await msg.reply_text(
-            f"⚠️ Видео слишком длинное ({msg.video_note.duration} сек). "
-            f"Максимум {MAX_DURATION_SECONDS} секунд — иначе обработка займёт слишком много времени."
-        )
-        return
-
-    file = await context.bot.get_file(msg.video_note.file_id)
-
-    tmp_dir = tempfile.mkdtemp()
-    input_path = os.path.join(tmp_dir, "input.mp4")
-    await file.download_to_drive(input_path)
-
-    context.user_data["pending_input_path"] = input_path
-    context.user_data["media_kind"] = "video_note"
-    context.user_data["awaiting_text"] = False
-    context.user_data["video_note_meta"] = {
-        "duration": msg.video_note.duration,
-        "length": msg.video_note.length,
-    }
-
-    keyboard = build_color_keyboard()
-    await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
+START_TEXT = (
+    "Привет! Я бот, который рисует эффект вокруг пары рук в форме «L» в твоём видео.\n\n"
+    "Нажми «Start» и отправь видео (файл, видеосообщение или документ с видео) — "
+    "я обработаю его и верну результат с эффектом.\n\n"
+    "Максимальная длина: 20 секунд. Поддерживаются большинство форматов — бот автоматически "
+    "конвертирует/обрезает при необходимости."
+)
 
 
-async def handle_regular_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-
-    if msg.video.duration and msg.video.duration > MAX_DURATION_SECONDS:
-        await msg.reply_text(
-            f"⚠️ Видео слишком длинное ({msg.video.duration} сек). "
-            f"Максимум {MAX_DURATION_SECONDS} секунд — иначе обработка займёт слишком много времени."
-        )
-        return
-
-    file = await context.bot.get_file(msg.video.file_id)
-
-    tmp_dir = tempfile.mkdtemp()
-    input_path = os.path.join(tmp_dir, "input.mp4")
-    await file.download_to_drive(input_path)
-
-    context.user_data["pending_input_path"] = input_path
-    context.user_data["media_kind"] = "video"
-    context.user_data["awaiting_text"] = False
-
-    keyboard = build_color_keyboard()
-    await msg.reply_text("🎨 Выбери цвет эффекта:", reply_markup=keyboard)
+HELP_TEXT = (
+    "Как пользоваться ботом — кратко:\n\n"
+    "1) Нажми «Start» или просто отправь видео (файл, видеосообщение или документ с видео).\n"
+    "2) Видео до 20 секунд. Если длиннее — бот обрежет первые 20 секунд.\n"
+    "3) В кадре покажи жест «L»: указательный палец прямо, остальные пальцы согнуты, большой палец отведён в сторону.\n"
+    "   - Рука 1 (L) справа, рука 2 (L) слева — бот рисует эффект между ними.\n"
+    "4) Желательно: хорошее освещение, минимальные резкие засветы/контрасты.\n"
+    "5) Если обработка идёт долго — можно нажать «Cancel», чтобы остановить.\n\n"
+    "Что подходит: .mp4, .mov, .mkv и другие — бот попытается перекодировать. Требования: на сервере должны быть ffmpeg и ffprobe.\n\n"
+    "Советы по стабильности рамки:\n"
+    "- Держите руки в кадре несколько кадров, не прячьте их на доли секунды.\n"
+    "- Если рамка дрожит, попробуйте поменьше резких движений или помедленнее двигаться.\n\n"
+    "Если нужно — могу добавить выбор цвета рамки, тонкую настройку чувствительности или трассировку оптическим потоком — напиши."
+)
 
 
-def build_color_keyboard():
-    buttons = []
-    row = []
-    for key, val in COLORS.items():
-        row.append(InlineKeyboardButton(val["name"], callback_data=f"color_{key}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(buttons)
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(START_TEXT, reply_markup=main_keyboard())
 
 
-async def handle_color_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # support both callback_query and plain command
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(HELP_TEXT)
+    else:
+        await update.effective_message.reply_text(HELP_TEXT)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # support both callback_query and command
+    if update.callback_query:
+        await update.callback_query.answer()
+        user_msg = update.callback_query.message
+    else:
+        user_msg = update.effective_message
+
+    ev = context.user_data.get("cancel_event")
+    if ev and isinstance(ev, threading.Event):
+        ev.set()
+        await user_msg.reply_text("⛔ Запрошена отмена задачи. Обработка остановится в ближайшее время.")
+    else:
+        await user_msg.reply_text("Нет активной обработки для отмены.")
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    data = query.data
+    if data == "btn_help":
+        await help_command(update, context)
+    elif data == "btn_start":
+        await query.answer()
+        await query.message.reply_text("Отправь мне видео (файл, видеосообщение или документ с видео). Максимум 20 секунд.", reply_markup=None)
+    elif data == "btn_cancel":
+        await cancel_command(update, context)
+    else:
+        await query.answer()
 
-    color_key = query.data.replace("color_", "")
-    color_bgr = COLORS.get(color_key, COLORS["purple"])["bgr"]
-    context.user_data["chosen_color"] = color_bgr
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ Добавить текст", callback_data="add_text")],
-        [InlineKeyboardButton("🚫 Без текста", callback_data="no_text")],
-    ])
-    await query.edit_message_text("Хочешь добавить текст внутрь рамки?", reply_markup=keyboard)
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    file_obj = None
+    media_kind = None
 
-
-async def handle_text_choice_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    input_path = context.user_data.get("pending_input_path")
-    color_bgr = context.user_data.get("chosen_color", (255, 0, 200))
-
-    if not input_path or not os.path.exists(input_path):
-        await query.edit_message_text("❌ Файл не найден, отправь кружок/видео заново")
+    # accept video, video_note, or document with video mime
+    if msg.video:
+        file_obj = await msg.video.get_file()
+        media_kind = "video"
+    elif msg.video_note:
+        file_obj = await msg.video_note.get_file()
+        media_kind = "video_note"
+    elif msg.document and (msg.document.mime_type or "").startswith("video"):
+        file_obj = await msg.document.get_file()
+        media_kind = "document"
+    else:
+        await msg.reply_text("Пожалуйста, отправь видеофайл, видеосообщение или документ с видео.")
         return
 
-    if query.data == "no_text":
-        context.user_data["awaiting_text"] = False
-        await query.edit_message_text("🔄 Обрабатываю без текста...")
-        await run_and_send(update, context, input_path, custom_text=None, color_bgr=color_bgr)
-
-    elif query.data == "add_text":
-        context.user_data["awaiting_text"] = True
-        await query.edit_message_text("✏️ Напиши текст на любом языке — он появится в рамке:")
-
-
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Реагируем на обычный текст только если реально ждём текст для рамки —
-    # иначе бот будет пытаться обработать любое случайное сообщение пользователя
-    if not context.user_data.get("awaiting_text"):
+    tmpf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmpf.close()
+    try:
+        # скачиваем файл
+        await file_obj.download_to_drive(tmpf.name)
+    except Exception as e:
+        logger.exception("Ошибка скачивания файла")
+        await msg.reply_text("Не удалось скачать файл. Попробуй ещё раз.")
+        try:
+            os.remove(tmpf.name)
+        except Exception:
+            pass
         return
 
-    text = update.message.text.strip()
-    input_path = context.user_data.get("pending_input_path")
-    color_bgr = context.user_data.get("chosen_color", (255, 0, 200))
+    context.user_data["media_kind"] = media_kind
+    await run_and_send(update, context, tmpf.name, custom_text=None, color_bgr=(255, 0, 200))
 
-    if not input_path or not os.path.exists(input_path):
-        await update.message.reply_text("❌ Файл не найден, отправь кружок/видео заново")
-        context.user_data["awaiting_text"] = False
-        return
-
-    if len(text) > 25:
-        await update.message.reply_text("⚠️ Текст слишком длинный (максимум 25 символов), напиши короче:")
-        return
-
-    context.user_data["awaiting_text"] = False
-    await run_and_send(update, context, input_path, custom_text=text, color_bgr=color_bgr)
+    # удаляем исходник по завершении (если он ещё есть)
+    try:
+        if os.path.exists(tmpf.name):
+            os.remove(tmpf.name)
+    except Exception:
+        pass
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    input_path = context.user_data.get("pending_input_path")
-    if input_path and os.path.exists(input_path):
-        os.remove(input_path)
-    context.user_data.clear()
-    await update.message.reply_text("Отменено.")
+# ========== App entrypoint ==========
 
+def build_app(token: str):
+    app = ApplicationBuilder().token(token).build()
 
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Отправь кружок (видеосообщение) или обычное видео с L-жестом двумя руками!\n\n"
-        "🤙 Указательный вверх + большой в сторону — обе руки, работает с любого расстояния.\n"
-        "После этого выберешь цвет эффекта и можно добавить текст на любом языке.\n\n"
-        "/cancel — отменить текущую операцию"
-    )
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    media_filter = filters.VIDEO | filters.VIDEO_NOTE | (filters.Document.EXTENSION | filters.Document.MIME_TYPE)
+    # simpler: accept video, video_note and document with video mime in handler itself
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_media))
 
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
-    app.add_handler(MessageHandler(filters.VIDEO, handle_regular_video))
-    app.add_handler(CallbackQueryHandler(handle_color_choice, pattern="^color_"))
-    app.add_handler(CallbackQueryHandler(handle_text_choice_buttons, pattern="^(add_text|no_text)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
-
-    logger.info("Бот запущен!")
-    app.run_polling()
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN env var is not set")
+        raise SystemExit(1)
+    application = build_app(BOT_TOKEN)
+    logger.info("Бот запущен")
+    application.run_polling()
 
 
 
