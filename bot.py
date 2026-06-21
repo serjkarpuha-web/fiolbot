@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-# name=bot.py
+```name=bot.py
+"""
+Robust Telegram bot for applying "L-hand" quad effect to short videos (<=20s).
+
+Features:
+- /start, /help, /cancel commands and inline buttons (Start / Help / Cancel).
+- Accepts video, video_note, document (with video mime). Downloads to temp file.
+- Prepares input via ffmpeg (convert/trim to 20s when needed).
+- Robust MediaPipe-based detection with deduplication, adaptive smoothing, outlier handling.
+- Multiple OpenCV fourcc fallbacks for VideoWriter to handle different environments.
+- Safe ffmpeg merging of video+audio, with fallback to video-only.
+- Cancel support using threading.Event (set by /cancel or Cancel button).
+- Automatic handling of telegram.error.Conflict: attempts to delete webhook and fall back to polling.
+- Helpful logging for debugging (INFO by default). Set DEBUG for more details.
+
+Requirements:
+- python-telegram-bot v20+
+- ffmpeg and ffprobe in PATH
+- OpenCV, MediaPipe, Pillow, numpy installed
+"""
 import os
 import logging
 import asyncio
@@ -13,6 +32,7 @@ import numpy as np
 import mediapipe as mp
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.error import Conflict as TGConflict
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -24,6 +44,9 @@ from telegram.ext import (
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://your-app.up.railway.app/
+PORT = int(os.environ.get("PORT", 8443))
+
 if not BOT_TOKEN:
     raise SystemExit("Error: BOT_TOKEN env var is not set")
 
@@ -34,15 +57,6 @@ mp_hands = mp.solutions.hands
 
 INDEX_TIP = 8
 THUMB_TIP = 4
-
-COLORS = {
-    "purple": {"name": "🟣 Пурпурный", "bgr": (255, 0, 200)},
-    "blue": {"name": "🔵 Синий", "bgr": (255, 100, 0)},
-    "green": {"name": "🟢 Зелёный", "bgr": (60, 255, 60)},
-    "red": {"name": "🔴 Красный", "bgr": (40, 30, 230)},
-    "yellow": {"name": "🟡 Жёлтый", "bgr": (40, 230, 230)},
-    "white": {"name": "⚪ Белый", "bgr": (240, 240, 240)},
-}
 
 FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -59,7 +73,7 @@ def find_font():
 
 FONT_PATH = find_font()
 
-# ---------- HELPER: hand geometry ----------
+# ---------- Geometry helpers ----------
 
 
 def _finger_extended(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
@@ -73,17 +87,6 @@ def _finger_extended(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
     dist_mcp = np.linalg.norm(mcp - wrist)
 
     return dist_tip > dist_pip * 1.05 and dist_tip > dist_mcp * 1.15
-
-
-def _finger_curled(lm, tip_idx, pip_idx, mcp_idx, wrist_idx=0):
-    wrist = np.array([lm[wrist_idx].x, lm[wrist_idx].y])
-    tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
-    pip = np.array([lm[pip_idx].x, lm[pip_idx].y])
-
-    dist_tip = np.linalg.norm(tip - wrist)
-    dist_pip = np.linalg.norm(pip - wrist)
-
-    return dist_tip < dist_pip * 1.15
 
 
 def get_hand_points(hand_landmarks, w, h):
@@ -120,7 +123,7 @@ def get_hand_points(hand_landmarks, w, h):
     return (ix, iy), (tx, ty)
 
 
-# ---------- IMAGE TEXT + EFFECTS ----------
+# ---------- Rendering helpers ----------
 
 
 def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
@@ -146,17 +149,15 @@ def draw_unicode_glow_text(img_bgr, text, center, box_width, color_bgr):
     glow_bgr = glow_blur[:, :, :3]
     glow_alpha = (glow_blur[:, :, 3:4].astype(np.float32) / 255.0) * 0.5
 
-    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - glow_alpha) + glow_bgr.astype(np.float32) * glow_alpha).astype(
-        np.uint8
-    )
+    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - glow_alpha) +
+                  glow_bgr.astype(np.float32) * glow_alpha).astype(np.uint8)
 
     sharp_np = cv2.cvtColor(np.array(glow_img), cv2.COLOR_RGBA2BGRA)
     sharp_bgr = sharp_np[:, :, :3]
     sharp_alpha = sharp_np[:, :, 3:4].astype(np.float32) / 255.0
 
-    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - sharp_alpha) + sharp_bgr.astype(np.float32) * sharp_alpha).astype(
-        np.uint8
-    )
+    img_bgr[:] = (img_bgr.astype(np.float32) * (1 - sharp_alpha) +
+                  sharp_bgr.astype(np.float32) * sharp_alpha).astype(np.uint8)
 
     return img_bgr
 
@@ -235,7 +236,7 @@ def detect_hands(hands_detector, frame, w, h):
     try:
         results = hands_detector.process(rgb)
     except Exception as e:
-        logger.warning(f"MediaPipe failed on frame, skipping: {e}")
+        logger.warning("MediaPipe failed on frame, skipping: %s", e)
         return []
 
     found = []
@@ -289,7 +290,6 @@ def pick_best_pair(hand_points, prev_center=None):
         return hand_points[0], hand_points[1]
 
     from itertools import combinations
-
     candidates = []
     for a, b in combinations(hand_points, 2):
         try:
@@ -392,7 +392,6 @@ def prepare_work_input(input_path, max_seconds=20):
 
 
 # ---------- CORE VIDEO PROCESSING ----------
-# NOTE: this is the robust version that handles short videos and multiple OpenCV fourcc fallbacks.
 
 
 def _process_video_inner(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
@@ -405,10 +404,8 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
             os.remove(work_input)
         return False
 
-    # Get fps/size safely
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     if fps <= 1.0:
-        # fallback: try to compute fps from frame_count/duration or default to 25
         try:
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             dur = ffprobe_duration(work_input)
@@ -418,15 +415,14 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
                 fps = 25.0
         except Exception:
             fps = 25.0
+
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
 
-    # unique temporary file for intermediate video
     tmpf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_video = tmpf.name
     tmpf.close()
 
-    # Try multiple fourcc candidates if one doesn't open
     fourcc_candidates = ["mp4v", "X264", "avc1", "H264"]
     out = None
     for fc in fourcc_candidates:
@@ -577,10 +573,10 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
         if frame_idx % 60 == 0:
             logger.info("Progress: %d/%d frames", frame_idx, total_frames)
 
-    # Close resources
     cap.release()
     out.release()
     hands.close()
+    logger.info("Frame processing finished: %d frames", frame_idx)
 
     if created_tmp and os.path.exists(work_input):
         try:
@@ -604,24 +600,10 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     logger.info("Intermediate video created: %d bytes", os.path.getsize(tmp_video))
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        tmp_video,
-        "-i",
-        input_path,
-        "-c:v",
-        "libx264",
-        "-c:a",
-        "aac",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-shortest",
-        "-pix_fmt",
-        "yuv420p",
-        output_path,
+        "ffmpeg", "-y", "-i", tmp_video, "-i", input_path,
+        "-c:v", "libx264", "-c:a", "aac",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-shortest", "-pix_fmt", "yuv420p", output_path,
     ]
     try:
         r1 = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -630,7 +612,6 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg (video+audio) timeout")
 
-    # cleanup intermediate
     try:
         if os.path.exists(tmp_video):
             os.remove(tmp_video)
@@ -643,10 +624,9 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
 
     try:
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "csv=p=0", output_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "csv=p=0", output_path],
+            capture_output=True, text=True, timeout=30
         )
         if probe.returncode != 0 or not probe.stdout.strip():
             logger.error("ffprobe failed to confirm file integrity: rc=%s stderr=%s", probe.returncode, probe.stderr)
@@ -661,7 +641,6 @@ def _process_video_inner(input_path: str, output_path: str, custom_text=None, co
 
 def process_video(input_path: str, output_path: str, custom_text=None, color_bgr=(255, 0, 200), cancel_event: threading.Event = None):
     import traceback
-
     try:
         return _process_video_inner(input_path, output_path, custom_text, color_bgr, cancel_event=cancel_event)
     except Exception as e:
@@ -669,7 +648,7 @@ def process_video(input_path: str, output_path: str, custom_text=None, color_bgr
         return False
 
 
-# ---------- async wrapper that runs processing in thread pool ----------
+# ---------- Async wrapper + Telegram integration ----------
 
 
 async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input_path: str, custom_text=None, color_bgr=(255, 0, 200)):
@@ -681,7 +660,9 @@ async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input
 
     try:
         loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(None, process_video, input_path, output_path, custom_text, color_bgr, cancel_event)
+        success = await loop.run_in_executor(
+            None, process_video, input_path, output_path, custom_text, color_bgr, cancel_event
+        )
 
         context.user_data.pop("cancel_event", None)
 
@@ -703,13 +684,14 @@ async def run_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, input
             pass
 
 
-# ---------- Telegram handlers, keyboard, commands ----------
+# ---------- Telegram UI ----------
 
 
 def main_keyboard():
     kb = [
-        [InlineKeyboardButton("▶️ Start", callback_data="btn_start"), InlineKeyboardButton("❓ Help", callback_data="btn_help")],
-        [InlineKeyboardButton("⛔ Cancel", callback_data="btn_cancel")],
+        [InlineKeyboardButton("▶️ Start", callback_data="btn_start"),
+         InlineKeyboardButton("❓ Help", callback_data="btn_help")],
+        [InlineKeyboardButton("⛔ Cancel", callback_data="btn_cancel")]
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -717,31 +699,25 @@ def main_keyboard():
 START_TEXT = (
     "Привет! Я бот, который рисует эффект вокруг пары рук в форме «L» в твоём видео.\n\n"
     "Нажми «Start» и отправь видео (файл, видеосообщение или документ с видео) — я обработаю его и верну результат с эффектом.\n\n"
-    "Максимальная длина: 20 секунд. Поддерживаются большинство форматов — бот автоматически конвертирует/обрежет при необходимости."
+    "Максимальная длина: 20 секунд."
 )
 
 HELP_TEXT = (
-    "Как пользоваться ботом — кратко:\n\n"
-    "1) Нажми «Start» или отправь видео (файл, видеосообщение или документ с видео).\n"
+    "Как пользоваться:\n"
+    "1) Нажми Start или отправь видео (файл/video_note/document).\n"
     "2) Видео до 20 секунд. Если длиннее — бот обрежет первые 20 секунд.\n"
-    "3) В кадре покажи жест «L»: указательный палец прямо, остальные пальцы согнуты, большой палец отведён в сторону.\n"
-    "   - Рука 1 (L) справа, рука 2 (L) слева — бот рисует эффект между ними.\n"
-    "4) Желательно: хорошее освещение, минимальные резкие засветы/контрасты.\n"
-    "5) Если обработка идёт долго — можно нажать «Cancel», чтобы остановить.\n\n"
-    "Что подходит: .mp4, .mov, .mkv и другие — бот попытается перекодировать. Требования: на сервере должны быть ffmpeg и ffprobe.\n\n"
-    "Советы по стабильности рамки:\n"
-    "- Держите руки в кадре несколько кадров, не прячьте их на доли секунды.\n"
-    "- Если рамка дрожит, попробуйте поменьше резких движений или помедленнее двигаться.\n"
+    "3) Покажи жест L (указательный палец вытянут, другие согнуты, большой отведён).\n"
+    "4) Нажми Cancel чтобы остановить обработку."
 )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("CMD /start from user_id=%s", update.effective_user.id)
+    logger.info("CMD /start user=%s", update.effective_user.id)
     await update.effective_message.reply_text(START_TEXT, reply_markup=main_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("CMD /help from user_id=%s", update.effective_user.id)
+    logger.info("CMD /help user=%s", update.effective_user.id)
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.message.reply_text(HELP_TEXT)
@@ -750,7 +726,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("CMD /cancel from user_id=%s", update.effective_user.id)
+    logger.info("CMD /cancel user=%s", update.effective_user.id)
     if update.callback_query:
         await update.callback_query.answer()
         user_msg = update.callback_query.message
@@ -760,7 +736,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ev = context.user_data.get("cancel_event")
     if ev and isinstance(ev, threading.Event):
         ev.set()
-        await user_msg.reply_text("⛔ Запрошена отмена задачи. Обработка остановится в ближайшее время.")
+        await user_msg.reply_text("⛔ Запрошена отмена. Обработка остановится в ближайшее время.")
     else:
         await user_msg.reply_text("Нет активной обработки для отмены.")
 
@@ -768,7 +744,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    logger.info("CallbackQuery data=%s from user_id=%s", data, update.effective_user.id)
+    logger.info("CallbackQuery data=%s from user=%s", data, update.effective_user.id)
     await query.answer()
     if data == "btn_help":
         await query.message.reply_text(HELP_TEXT)
@@ -811,7 +787,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Downloading file to %s", tmpf.name)
         await file_obj.download_to_drive(tmpf.name)
     except Exception as e:
-        logger.exception("Error downloading file")
+        logger.exception("Error downloading file: %s", e)
         await msg.reply_text("Не удалось скачать файл. Попробуй ещё раз.")
         try:
             os.remove(tmpf.name)
@@ -821,10 +797,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["media_kind"] = media_kind
 
-    # Run processing
     await run_and_send(update, context, tmpf.name, custom_text=None, color_bgr=(255, 0, 200))
 
-    # Ensure local file removed
     try:
         if os.path.exists(tmpf.name):
             os.remove(tmpf.name)
@@ -834,10 +808,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Text from %s: %s", update.effective_user.id, update.effective_message.text)
-    await update.effective_message.reply_text("Я ожидаю видео: отправь файл/видео/видеосообщение или нажми /help")
+    await update.effective_message.reply_text("Я ожидаю видео: отправь файл/видео_сообщение/документ или нажми /help")
 
 
-# ---------- APP BUILD & RUN ----------
+# ---------- App build and run ----------
 
 
 def build_app(token: str):
@@ -849,12 +823,11 @@ def build_app(token: str):
 
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    # Explicit media handlers
+    # explicit handlers for media types
     app.add_handler(MessageHandler(filters.VIDEO, handle_media))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_media))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_media))
 
-    # fallback for text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_fallback))
 
     return app
@@ -862,8 +835,39 @@ def build_app(token: str):
 
 if __name__ == "__main__":
     application = build_app(BOT_TOKEN)
-    logger.info("Bot started")
-    application.run_polling()
+
+    # Try to start webhook if WEBHOOK_URL provided; otherwise polling.
+    # If telegram.error.Conflict occurs, attempt to delete webhook programmatically and fallback to polling.
+    try:
+        if WEBHOOK_URL:
+            url_path = BOT_TOKEN  # secret path ensures uniqueness
+            webhook_url = WEBHOOK_URL.rstrip("/") + "/" + url_path
+            logger.info("Starting in webhook mode: listen=0.0.0.0:%d webhook_url=%s", PORT, webhook_url)
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=url_path,
+                webhook_url=webhook_url,
+            )
+        else:
+            logger.info("Starting in polling mode")
+            application.run_polling()
+    except TGConflict:
+        logger.warning("Telegram Conflict detected (another getUpdates/webhook exists). Attempting to delete webhook and start polling.")
+        # try to delete webhook and retry polling
+        try:
+            # application.bot is available once built
+            bot = application.bot
+            # run delete_webhook synchronously
+            asyncio.run(bot.delete_webhook(timeout=10))
+            logger.info("deleteWebhook called; retrying polling start")
+            application.run_polling()
+        except Exception as e:
+            logger.exception("Retry after deleting webhook failed: %s", e)
+            raise
+    except Exception as e:
+        logger.exception("Unhandled exception while starting bot: %s", e)
+        raise
 
 
 
